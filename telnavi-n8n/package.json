@@ -9,6 +9,8 @@
     "axios-cookiejar-support": "^6.0.2",
     "cheerio": "^1.0.0-rc.12",
     "express": "^4.19.2",
+    "http-proxy-agent": "^7.0.2",
+    "https-proxy-agent": "^7.0.4",
     "tough-cookie": "^4.1.3"
   }
 }
