@@ -1,0 +1,102 @@
+{
+  "name": "Telnavi Auto Post",
+  "nodes": [
+    {
+      "parameters": {
+        "triggerTimes": {
+          "item": [
+            {
+              "mode": "everyHour"
+            }
+          ]
+        }
+      },
+      "id": "1",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "keepOnlySet": true,
+        "values": {
+          "string": [
+            {
+              "name": "phone",
+              "value": "08033951807"
+            },
+            {
+              "name": "comment",
+              "value": "営業電話"
+            },
+            {
+              "name": "callform",
+              "value": "営業電話"
+            },
+            {
+              "name": "rating",
+              "value": "1"
+            }
+          ]
+        }
+      },
+      "id": "2",
+      "name": "Set",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 1,
+      "position": [
+        500,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "requestMethod": "POST",
+        "jsonParameters": true,
+        "responseFormat": "json",
+        "options": {},
+        "url": "http://localhost:3000/post",
+        "bodyParametersJson": "{\n  \"phone\": \"{{$json.phone}}\",\n  \"comment\": \"{{$json.comment}}\",\n  \"callform\": \"{{$json.callform}}\",\n  \"rating\": \"{{$json.rating}}\"\n}"
+      },
+      "id": "3",
+      "name": "HTTP Request",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 2,
+      "position": [
+        760,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Set",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {},
+  "id": "1"
+}
