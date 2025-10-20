@@ -1,7 +1,7 @@
 import express from 'express';
 import { chromium } from 'playwright';
 
-const PORT = Number(process.env.PORT || 3000);
+const PORT = process.env.PORT || 10000;
 const TELNAVI_URL = 'https://www.telnavi.jp/phone/';
 
 const app = express();
