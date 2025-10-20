@@ -1,76 +1,92 @@
 const express = require('express');
-const { chromium } = require('playwright');
+const { CookieJar } = require('tough-cookie');
+const { wrapper } = require('axios-cookiejar-support');
+const axiosBase = require('axios');
+const cheerio = require('cheerio');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(
-  express.json({
-    limit: '1mb',
-    type: ['application/json', 'application/*+json', 'text/plain'],
-  }),
-);
+// Body parsers
+app.use(express.json({ limit: '1mb', type: ['application/json', 'application/*+json', 'text/plain'] }));
 app.use(express.urlencoded({ extended: true }));
 
-async function getBrowser() {
-  return chromium.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-  });
+const UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36';
+
+function createClient() {
+  const jar = new CookieJar();
+  const client = wrapper(
+    axiosBase.create({
+      jar,
+      timeout: 45000,
+      maxRedirects: 5,
+      headers: {
+        'User-Agent': UA,
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'ja,en;q=0.9',
+        Connection: 'keep-alive',
+      },
+      validateStatus: () => true,
+    }),
+  );
+  return client;
 }
 
+app.get('/healthz', (_, res) => res.json({ ok: true }));
+
 app.post('/post', async (req, res) => {
-  const started = Date.now();
+  const t0 = Date.now();
   try {
     const { phone, comment, callform, rating } = req.body || {};
     if (!phone) return res.status(400).json({ ok: false, error: 'phone is required' });
 
-    const browser = await getBrowser();
-    const context = await browser.newContext({
-      userAgent:
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-    });
-    const page = await context.newPage();
-
+    const client = createClient();
     const phoneUrl = `https://www.telnavi.jp/phone/${phone}`;
-    await page.goto(phoneUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
 
-    // 口コミ投稿フォームの token を抽出（input[name="token"] の value）
-    const token = await page.getAttribute('form[action$="/post"] input[name="token"]', 'value');
-    if (!token) throw new Error('token not found on page');
+    // 1) ページ取得
+    const getResp = await client.get(phoneUrl, { headers: { Referer: phoneUrl } });
+    if (getResp.status >= 400) throw new Error(`GET phone page failed: ${getResp.status}`);
 
-    // 送信に必要なフォーム項目をまとめて POST
-    // callform = 投稿目的（"営業電話" など）
-    // rating   = 評価(1-5) → サイトの name が "phone_rating" のはず
+    // 2) token 抽出
+    const $ = cheerio.load(getResp.data);
+    const token =
+      $('form[action$="/post"] input[name="token"]').attr('value') || $('input[name="token"]').attr('value');
+    if (!token) throw new Error('token not found');
+
+    // 3) POST 送信（URL エンコード）
     const postUrl = `https://www.telnavi.jp/phone/${phone}/post`;
-    const resp = await page.request.post(postUrl, {
-      form: {
-        callform,
-        phone_rating: String(rating || 1),
-        comment: comment || '',
-        agreement: '1',
-        token,
-        attrib: '0',
-        submit: '書き込む',
-      },
-      timeout: 45000,
+    const body = new URLSearchParams({
+      callform: callform || '営業電話',
+      phone_rating: String(rating || 1),
+      comment: comment || '',
+      agreement: '1',
+      token,
+      attrib: '0',
+      submit: '書き込む',
     });
 
-    const ok = resp.status() === 200 || resp.status() === 302;
-    await browser.close();
-    res.status(ok ? 200 : 500).json({
+    const postResp = await client.post(postUrl, body.toString(), {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Origin: 'https://www.telnavi.jp',
+        Referer: phoneUrl,
+      },
+      maxRedirects: 0, // 302 をそのまま返させる
+      validateStatus: () => true,
+    });
+
+    const ok = [200, 302].includes(postResp.status);
+    return res.status(ok ? 200 : 500).json({
       ok,
-      status: resp.status(),
-      took_ms: Date.now() - started,
+      status: postResp.status,
+      took_ms: Date.now() - t0,
     });
   } catch (e) {
     console.error(e);
-    res.status(500).json({
+    return res.status(500).json({
       ok: false,
       error: e.message,
-      stack: String(e.stack || '')
-        .split('\n')
-        .slice(0, 4)
-        .join(' | '),
+      took_ms: Date.now() - t0,
     });
   }
 });
