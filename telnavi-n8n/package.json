@@ -1,12 +1,12 @@
 {
   "name": "telnavi-n8n",
   "version": "1.0.0",
-  "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "postinstall": "npx playwright install chromium --with-deps"
   },
   "dependencies": {
     "express": "^4.19.2",
-    "playwright": "^1.47.2"
+    "playwright": "^1.47.0"
   }
 }
