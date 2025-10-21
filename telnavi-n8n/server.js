@@ -98,245 +98,181 @@ app.get('/debug', (req, res) => {
 
 // コメント投稿API
 app.post('/post', async (req, res) => {
-  // -------- input extraction (fallback to query) --------
-  const payload = req.body && Object.keys(req.body).length ? req.body : req.query;
-  const phone = (payload?.phone ?? '').toString().trim();
-  const comment = (payload?.comment ?? '').toString();
-  const callform = (payload?.callform ?? '').toString();
-  const rating = Number(payload?.rating ?? 1);
+  let browser;
+  const take = (k, def='') => {
+    const v = (req.body?.[k] ?? req.query?.[k] ?? '').toString().trim();
+    return v || def;
+  };
 
-  // server-side logging to trace what arrived
-  console.log('[post] headers:', req.headers);
-  console.log('[post] body   :', req.body);
-  console.log('[post] query  :', req.query);
+  // accept both JSON and x-www-form-urlencoded (kept by upstream middlewares)
+  const phone   = take('phone');
+  const comment = take('comment');
+  const callform= take('callform');
+  const rating  = take('rating', '1'); // "1".."5"
 
-  if (!phone) return res.status(400).json({ ok: false, error: 'phone is required (body or query)' });
+  if (!phone) return res.status(400).json({ ok:false, error:'phone is required' });
 
-  // make sure downstream code reads the normalized variables
-  req.body = { phone, comment, callform, rating };
+  const postUrl = `https://www.telnavi.jp/phone/${encodeURIComponent(phone)}/post`;
 
-  const phoneUrl = `https://www.telnavi.jp/phone/${encodeURIComponent(phone)}`;
-
-  let context;
+  let page;
   try {
-    context = await launchPersistentContext();
-    const page = await context.newPage();
-    await ensureClearance(context, page);
+    browser = await chromium.launch({ headless: true });
+    const ctx = await browser.newContext({
+      userAgent: UA,
+      locale: 'ja-JP',
+    });
+    page = await ctx.newPage();
 
-    console.log('[post] open:', phoneUrl);
-    const first = await page.goto(phoneUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    console.log('[post] first status:', first ? first.status() : 'none');
-
-    // CF対策の小休止（JS challenge等の完了待ち）
-    await page.waitForTimeout(5000);
-    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-    // ほんの少し待つ（CF の遅延処理対策）
-    await page.waitForTimeout(500);
-    console.log('[post] after idle');
-
-    const allForms = await page.locator('form').all();
-    let formHandle = null;
-    let postUrl = null;
-
-    for (const f of allForms) {
-      const action = (await f.getAttribute('action')) || '';
-      const abs = action ? new URL(action, phoneUrl).toString() : phoneUrl;
-      if (isPhonePostPath(abs)) {
-        formHandle = f;
-        postUrl = abs;
-        break;
-      }
-    }
-    if (!formHandle) {
-      for (const f of allForms) {
-        const hasComment = await f.locator('textarea[name*="comment"]').count();
-        const action = (await f.getAttribute('action')) || '';
-        const abs = action ? new URL(action, phoneUrl).toString() : phoneUrl;
-        if (hasComment && !abs.includes('/search')) {
-          formHandle = f;
-          postUrl = abs;
-          break;
-        }
-      }
-    }
-    if (!formHandle) throw new Error('comment form not found');
-    console.log('[post] picked form action:', postUrl);
-
-    const cVal = comment || '営業電話';
-    const cfVal = callform || '営業電話';
-    const rVal = String(rating ?? 1);
-
-    const commentEl = formHandle.locator('textarea[name*="comment"], textarea#comment').first();
-    if (await commentEl.isVisible().catch(() => false)) await commentEl.fill(cVal);
-
-    const nameEl = formHandle.locator('input[name="name"], #name').first();
-    if (await nameEl.isVisible().catch(() => false)) await nameEl.fill('');
-
-    const selectCF = formHandle.locator('select[name="callform"]');
-    if (await selectCF.isVisible().catch(() => false)) {
-      await selectCF.selectOption({ label: cfVal }).catch(async () => {
-        const options = await selectCF.locator('option').all();
-        for (const o of options) {
-          const v = (await o.getAttribute('value')) || '';
-          const t = (await o.textContent())?.trim() || '';
-          if (v.includes(cfVal) || t.includes(cfVal)) {
-            await selectCF.selectOption(v);
-            break;
-          }
-        }
-      });
-    } else {
-      const radioCF = formHandle.locator('input[type="radio"][name="callform"]');
-      if (await radioCF.count()) {
-        const all = await radioCF.all();
-        for (const r of all) {
-          const v = (await r.getAttribute('value')) || '';
-          const id = (await r.getAttribute('id')) || '';
-          const labelText = id
-            ? (await page.locator(`label[for="${id}"]`).textContent().catch(() => ''))?.trim()
-            : '';
-          if (v.includes(cfVal) || labelText.includes(cfVal)) {
-            await r.check().catch(() => {});
-            break;
-          }
-        }
-      } else {
-        const textCF = formHandle.locator('input[name="callform"]');
-        if (await textCF.isVisible().catch(() => false)) await textCF.fill(cfVal);
-      }
-    }
-
-    const ratingRadio = formHandle.locator(`input[name="phone_rating"][value="${rVal}"]`);
-    if (await ratingRadio.isVisible().catch(() => false)) await ratingRadio.check().catch(() => {});
-
-    const tryFetchInPage = async () => {
-      return await formHandle.evaluate(async (node, actionAbs) => {
-        const form = node instanceof HTMLFormElement ? node : node.closest('form');
-        if (!form) throw new Error('form not found for fetch');
-        const fd = new FormData(form);
-        const resp = await fetch(actionAbs, { method: 'POST', body: fd, credentials: 'include' });
-        return { status: resp.status, url: resp.url, redirected: resp.redirected };
-      }, postUrl);
+    // Helper: log & safe innerHTML sample on failure
+    const htmlSample = async () => {
+      try {
+        const h = await page.evaluate(() => document.body?.innerHTML?.slice(0, 1500) || '');
+        return h;
+      } catch { return ''; }
     };
 
-    const tryApiFallback = async () => {
-      const payload = await formHandle.evaluate((form) => {
-        const data = {};
-        const els = form.querySelectorAll('input, textarea, select');
-        for (const el of els) {
-          if (!el.name) continue;
-          if ((el.type === 'radio' || el.type === 'checkbox') && !el.checked) continue;
-          data[el.name] = el.value ?? '';
+    await page.goto(postUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForSelector('form', { timeout: 15000 });
+
+    // Helper: find input/textarea by heading text near it (robust to class/name changes)
+    const findFieldByHeading = async (headingText, type = 'input, textarea') => {
+      const handle = await page.evaluateHandle((text, sel) => {
+        // Find the nearest container that contains the heading text
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+        const candidates = [];
+        while (walker.nextNode()) {
+          const el = walker.currentNode;
+          const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
+          if (t.includes(text)) candidates.push(el);
         }
-        return data;
-      });
-      // Referer/Origin を明示（WAF 対策）
-      return await context.request.post(postUrl, {
-        form: payload,
-        headers: {
-          Referer: phoneUrl,
-          Origin: 'https://www.telnavi.jp',
-        },
-        timeout: 20000,
-      });
+        // Prefer the closest ancestor with a form control inside
+        for (const box of candidates) {
+          const ctl = box.querySelector(sel);
+          if (ctl) return ctl;
+        }
+        // fallback: search globally after matching text
+        return document.querySelector(sel);
+      }, headingText, type);
+      return handle.asElement();
     };
 
-    // ちょっと人間ぽく：フォームへスクロール＆フォーカス
-    try {
-      await formHandle.scrollIntoViewIfNeeded();
-      await page.waitForTimeout(200);
-    } catch {}
+    // 1) どこからの電話でしたか？
+    const fromInput =
+      (await findFieldByHeading('どこからの電話でしたか？', 'input[type="text"]')) ||
+      (await findFieldByHeading('どこからの電話でしたか',   'input[type="text"]'));
+    if (fromInput && callform) {
+      await fromInput.scrollIntoViewIfNeeded();
+      await fromInput.fill(callform, { timeout: 15000 });
+    }
 
-    let status = 0;
-    let location = null;
+    // 2) 電話の目的は何でしたか？（表記ゆれ対応）
+    const purposeInput =
+      (await findFieldByHeading('電話の目的は何でしたか？', 'input[type="text"]')) ||
+      (await findFieldByHeading('電話の目的',               'input[type="text"]'));
+    if (purposeInput && callform) {
+      await purposeInput.scrollIntoViewIfNeeded();
+      await purposeInput.fill(callform, { timeout: 15000 });
+    }
 
-    // 1) ネイティブ form submit（最優先）
-    try {
-      const postUrlGuess = await page.evaluate(() => {
-        const f = document.querySelector('form[action*="/post"]');
-        return f ? new URL(f.getAttribute('action'), location.href).href : null;
+    // 3) 他にも情報があればご記入ください（コメント）
+    const commentArea =
+      (await findFieldByHeading('他にも情報があればご記入ください', 'textarea')) ||
+      (await findFieldByHeading('クチコミ',                         'textarea')) ||
+      (await page.$('form textarea'));
+    if (!commentArea) {
+      return res.status(500).json({
+        ok:false,
+        status: 500,
+        error:'comment form not found',
+        hint: await htmlSample(),
       });
-      console.log('[post] postUrl guess:', postUrlGuess);
+    }
+    await commentArea.scrollIntoViewIfNeeded();
+    if (comment) await commentArea.fill(comment, { timeout: 15000 });
 
-      const waitPost = postUrlGuess
-        ? page.waitForResponse((r) => r.url().startsWith(postUrlGuess), { timeout: 10000 })
-        : page.waitForNavigation({ waitUntil: 'networkidle', timeout: 10000 });
+    // 4) ★評価（label click → fallback: set checked）
+    const tryClickLabel = async () => {
+      const label =
+        (await page.$(`label[for*="phone_rating"][for$="-${rating}"]`)) ||
+        (await page.$(`label[for*="rating"][for$="-${rating}"]`)) ||
+        (await page.locator('label').filter({ hasText: String(rating) }).first());
+      if (label) {
+        await label.scrollIntoViewIfNeeded();
+        await label.click({ timeout: 15000, force: true });
+        return true;
+      }
+      return false;
+    };
 
-      await page.evaluate(() => {
-        const f = document.querySelector('form[action*="/post"]');
-        if (!f) throw new Error('form not found');
-        if (typeof f.requestSubmit === 'function') {
-          f.requestSubmit();
-        } else {
-          f.submit();
+    const clicked = await tryClickLabel();
+    if (!clicked) {
+      // directly set the radio input checked
+      await page.evaluate((val) => {
+        const el =
+          document.querySelector(`input[name="phone_rating"][value="${val}"]`) ||
+          document.querySelector(`input[type="radio"][name*="rating"][value="${val}"]`);
+        if (el) {
+          el.checked = true;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
         }
+      }, String(rating));
+    }
+
+    // 5) 送信
+    const submit =
+      (await page.$('form button[type="submit"]')) ||
+      (await page.$('form input[type="submit"]'))  ||
+      (await page.getByRole('button', { name: /投稿/ }).elementHandle());
+    if (!submit) {
+      return res.status(500).json({
+        ok:false,
+        status: 500,
+        error:'submit button not found',
+        hint: await htmlSample(),
       });
+    }
+    await submit.scrollIntoViewIfNeeded();
+    await submit.click({ timeout: 15000 });
 
-      const navOrResp = await waitPost;
-      const postStatus = typeof navOrResp?.status === 'function' ? navOrResp.status() : 200;
-      const postUrlFinal =
-        typeof navOrResp?.url === 'function' ? navOrResp.url() : postUrlGuess || postUrl;
-      console.log('[post] native submit ->', postStatus, postUrlFinal);
-      if (postStatus < 400) {
-        return res.json({ ok: true, status: postStatus, postUrl: postUrlFinal, location: null });
-      }
-      status = postStatus;
-    } catch (e) {
-      console.log('[post] native submit error:', String(e));
+    // 6) 成功待ち: /post を抜ける or 成功メッセージ
+    await Promise.race([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }),
+      page.waitForSelector('text=/投稿ありがとうございました|投稿を受け付けました/', { timeout: 30000 }),
+    ]).catch(() => null);
+
+    const finalUrl = page.url();
+    const ok = !/\/post(?:\?|$)/.test(finalUrl);
+
+    if (ok) {
+      return res.status(200).json({
+        ok: true,
+        status: 200,
+        url: finalUrl,
+      });
     }
 
-    // 2) fetch(FormData)
-    if (!(status >= 200 && status < 400)) {
-      try {
-        const r = await tryFetchInPage();
-        status = r.status;
-        console.log('[post] fetch(FormData) ->', status, r.url || '');
-        if (status < 400) {
-          return res.json({
-            ok: true,
-            status,
-            postUrl: r.url || postUrl,
-            location: null,
-          });
-        }
-      } catch (e) {
-        console.log('[post] fetch(FormData) error:', String(e));
-      }
-    }
-
-    // 3) context.request.post
-    if (!(status >= 200 && status < 400)) {
-      try {
-        const resp = await tryApiFallback();
-        status = resp.status();
-        const headers = typeof resp.headers === 'function' ? resp.headers() : resp.headers || {};
-        location = headers['location'] || headers['Location'] || null;
-        console.log('[post] request.post ->', status, location || '');
-
-        if (status >= 300 && status < 400 && location) {
-          const followUrl = new URL(location, postUrl).href;
-          const follow = await context.request.get(followUrl, { timeout: 15000 });
-          status = follow.status();
-          console.log('[post] follow ->', status);
-        }
-
-        if (status < 400) {
-          return res.json({ ok: true, status, postUrl, location });
-        }
-      } catch (e) {
-        console.log('[post] request.post error:', String(e));
-      }
-    }
-
-    console.log('[post] final ->', { ok: false, status, postUrl, location });
-    res.status(500).json({ ok: false, status, postUrl, location });
+    return res.status(500).json({
+      ok:false,
+      status: 500,
+      error: 'submission did not complete',
+      hint: await htmlSample(),
+    });
   } catch (e) {
-    console.log('[post] error:', e);
-    res.status(500).json({ ok: false, error: String(e) });
+    let hint = '';
+    try {
+      if (page) {
+        hint = await page.evaluate(() => document.body?.innerHTML?.slice(0, 1500) || '');
+      }
+    } catch {}
+    return res.status(500).json({
+      ok:false,
+      status: 500,
+      error: String(e),
+      hint,
+    });
   } finally {
-    if (context) {
-      await context.close().catch(() => {});
-    }
+    if (browser) await browser.close().catch(()=>{});
   }
 });
 
