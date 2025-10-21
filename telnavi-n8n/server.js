@@ -39,6 +39,9 @@ const PROFILE_DIR = path.join(process.cwd(), 'chrome-profile');
 const userDir = PROFILE_DIR;
 const launchArgs = [];
 
+const POST_FORM_SEL = 'form[action$="/post"], #go_post_form';
+const POST_LINK_SEL = 'a[href$="/post"]';
+
 const sanitize = (body = {}, query = {}) => {
   const source = { ...query, ...body };
   const take = (key, fallback = '') => {
@@ -49,6 +52,7 @@ const sanitize = (body = {}, query = {}) => {
     phone: take('phone'),
     comment: take('comment', ''),
     callform: take('callform', ''),
+    callfrom: take('callfrom', take('callform', '')),
     rating: take('rating', '1'),
   };
 };
@@ -105,7 +109,8 @@ async function ensureClearance(context, page) {
 async function waitCloudflare(page, timeoutMs = 10000) {
   const deadline = Date.now() + timeoutMs;
   const selector =
-    '#challenge-form, .challenge-form, #cf-please-wait, .cf-browser-verification, #cf-chl-widget, [data-cf],[id*="challenge"]';
+    '#challenge-form, .challenge-form, #cf-please-wait, .cf-browser-verification, #cf-chl-widget, ' +
+    '.cf-wrapper, .cf-im-under-attack, .cf-please-wait, #challenge-error-title';
   while (Date.now() < deadline) {
     const challenge = await page.$(selector);
     if (!challenge) return;
@@ -143,7 +148,7 @@ app.post('/post', async (req, res) => {
   console.log('[post] body   :', req.body);
   console.log('[post] query  :', req.query);
 
-  const { phone, comment, callform, rating } = sanitize(req.body || {}, req.query || {});
+  const { phone, comment, callform, callfrom, rating } = sanitize(req.body || {}, req.query || {});
   if (!phone) {
     return res
       .status(400)
@@ -161,7 +166,8 @@ app.post('/post', async (req, res) => {
     });
     page = await context.newPage();
 
-    const phoneUrl = `https://www.telnavi.jp/phone/${phone}`;
+    const BASE = 'https://www.telnavi.jp';
+    const phoneUrl = `${BASE}/phone/${phone}`;
     const postUrl = `${phoneUrl}/post`;
     console.log('[post] open:', postUrl);
 
@@ -177,84 +183,112 @@ app.post('/post', async (req, res) => {
       await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 45_000 }).catch(() => {});
     }
 
-    const hasFormInitially = await page.locator('form[action^="/post"]').count();
-    if (!hasFormInitially) {
-      console.log('[post] form not on /post -> try from phone page');
-      await page.goto(phoneUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-      const goPost = page
-        .locator('a[href$="/post"], a.go_post_button, a:has-text("口コミを書く"), a:has-text("クチコミを書く")')
-        .first();
-      if (await goPost.count()) {
-        await Promise.all([
-          page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {}),
-          goPost.click({ delay: 50 }),
-        ]);
+    // --- move to /post and ensure form appears ---
+    {
+      const targetPostUrl = `${BASE}/phone/${phone}/post`;
+
+      if (!page.url().includes('/post')) {
+        await page.goto(targetPostUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await page.waitForLoadState('networkidle');
+      }
+
+      if (await page.locator(POST_FORM_SEL).count() === 0) {
+        const link = page.locator(POST_LINK_SEL).first();
+        if (await link.count()) {
+          await Promise.all([
+            page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
+            link.click(),
+          ]);
+          await page.waitForLoadState('networkidle');
+        }
       }
     }
 
-    const form = page.locator('form[action^="/post"]').first();
-    await form.waitFor({ state: 'visible', timeout: 45_000 });
+    // --- 移動：/phone → /post（リンクがあればクリック、無ければ直接遷移） ---
+    const phoneLanding = `https://www.telnavi.jp/phone/${phone}`;
+    const postLanding = `https://www.telnavi.jp/phone/${phone}/post`;
 
-    const commentField = await queryVisible(form, [
-      'textarea[name="comment"]',
-      'textarea#comment',
-      'textarea[name="postcomment"]',
-      'textarea[name="message"]',
-      'textarea',
-    ]);
-    if (!commentField) throw new Error('comment form not found');
-    await commentField.scrollIntoViewIfNeeded?.();
-    await commentField.fill(comment ?? '', { timeout: 20_000 });
+    await page.goto(phoneLanding, { waitUntil: 'domcontentloaded' });
 
-    if (callform) {
-      const callformField = await queryVisible(form, [
-        'input[name="callfrom"]',
-        'input[name="callform"]',
-        'input[name="post01"]',
-        'input[name="title"]',
-        'input[type="text"]',
+    const postLink = page.locator('a[href$="/post"], a[href*="/post?"]');
+    if (await postLink.count()) {
+      await Promise.all([
+        page.waitForURL(/\/phone\/\d+\/post/),
+        postLink.first().click(),
       ]);
-      if (callformField) {
-        await callformField.scrollIntoViewIfNeeded?.();
-        await callformField.fill(callform, { timeout: 20_000 });
+    } else {
+      await page.goto(postLanding, { waitUntil: 'domcontentloaded' });
+    }
+
+    await waitCloudflare(page, 120000);
+
+    const form = page.locator('form[action*="/post"]').first();
+    await form.waitFor({ state: 'visible', timeout: 60000 });
+    await form.scrollIntoViewIfNeeded();
+
+    const actionAttr = await form.getAttribute('action');
+    console.log('[post] form action:', actionAttr);
+
+    if (callfrom && callfrom.trim()) {
+      const fromBox = form.locator(
+        [
+          'input[name*="from"]',
+          'input[placeholder*="どこから"]',
+          'input[name*="発信"]',
+        ].join(',')
+      );
+      if (await fromBox.count()) {
+        await fromBox.first().fill(callfrom);
       }
     }
 
-    const ratingLocator = form.locator(`input[type="radio"][name="phone_rating"][value="${Number(rating || 1)}"]`);
-    if ((await ratingLocator.count()) === 0) throw new Error('rating input not found');
-    await ratingLocator.first().scrollIntoViewIfNeeded?.();
-    await ratingLocator.first().check({ force: true });
-
-    const submitSel = [
-      'form[action*="/post"] button[type="submit"]',
-      'form[action*="/post"] input[type="submit"]',
-      '#go_post',
-      '.go_post_button',
-      'button:has-text("投稿")',
-      'input[type="submit"][value*="投稿"]',
-    ];
-    let submitEl = null;
-    for (const sel of submitSel) {
-      submitEl = await page.$(sel);
-      if (submitEl) break;
+    if (callform && callform.trim()) {
+      const purposeBox = form.locator(
+        [
+          'input[name*="form"]',
+          'input[name*="目的"]',
+          'input[placeholder*="目的"]',
+        ].join(',')
+      );
+      if (await purposeBox.count()) {
+        await purposeBox.first().fill(callform);
+      }
     }
-    if (!submitEl) throw new Error('submit button not found');
-    await submitEl.scrollIntoViewIfNeeded?.();
-    await Promise.all([
-      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {}),
-      submitEl.click({ timeout: 20_000 }),
-    ]).catch(() => {});
 
+    const commentArea = form.locator('textarea[name="comment"], textarea[name*="comment"]');
+    if (await commentArea.count()) {
+      await commentArea.first().fill(comment || '');
+    } else {
+      throw new Error('comment textarea not found');
+    }
+
+    if (rating != null) {
+      const ratingStr = String(rating);
+      const ratingRadio = form.locator(`input[type="radio"][name$="rating"][value="${ratingStr}"]`);
+      if (await ratingRadio.count()) {
+        await ratingRadio.first().check({ force: true });
+      } else {
+        const anyRating = form.locator('input[type="radio"][name$="rating"]');
+        if (await anyRating.count()) await anyRating.first().check({ force: true });
+      }
+    }
+
+    const submitBtn = form.locator('input[type="submit"], button[type="submit"]');
+    await Promise.all([
+      page.waitForLoadState('domcontentloaded'),
+      submitBtn.first().click(),
+    ]);
+
+    const status = 200;
+    const postUrlResult = page.url();
     const okText = await page
       .locator('text=/投稿ありがとうございます|投稿を受け付けました/i')
       .first()
       .isVisible()
       .catch(() => false);
-    const ok = okText || !/\/post(?:$|\?)/.test(page.url());
-    console.log('[post] final ->', { ok, url: page.url() });
-
-    const status = ok ? 200 : 500;
-    return res.status(status).json({ ok, status, postUrl: page.url() });
+    const ok = okText || !/\/post(?:$|\?)/.test(postUrlResult);
+    if (!ok) throw new Error('submission did not complete');
+    return res.status(status).json({ ok: true, status, postUrl: postUrlResult });
   } catch (e) {
     console.log('[post] error:', e);
     if (page) {
