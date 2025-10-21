@@ -5,23 +5,26 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+const HEADLESS = process.env.HEADLESS === '1'; // 未設定=可視、1=ヘッドレス
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
-const COMMON_HEADERS = {
-  'User-Agent': UA,
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-  'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
-  'Connection': 'keep-alive',
-  'Upgrade-Insecure-Requests': '1',
-};
+function isPhonePostPath(urlStr) {
+  try {
+    const p = new URL(urlStr).pathname;
+    return /^\/phone\/.+\/(post|comments)$/.test(p);
+  } catch { return false; }
+}
 
 app.get('/healthz', (_, res) => res.json({ ok: true }));
 
 app.get('/debug', async (_, res) => {
   let browser;
   try {
-    browser = await chromium.launch({ headless: true });
+    browser = await chromium.launch({
+      headless: HEADLESS ? true : false,
+      channel: 'chrome',
+    });
     const context = await browser.newContext({ userAgent: UA, locale: 'ja-JP' });
     const page = await context.newPage();
     const resp = await page.goto('https://www.telnavi.jp/', {
@@ -37,7 +40,7 @@ app.get('/debug', async (_, res) => {
   }
 });
 
-// コメント投稿（/phone/* の post/comments のみ）
+// コメント投稿API
 app.post('/post', async (req, res) => {
   const { phone, comment, callform, rating } = req.body || {};
   if (!phone) return res.status(400).json({ ok: false, error: 'phone is required' });
@@ -46,48 +49,44 @@ app.post('/post', async (req, res) => {
 
   let browser;
   try {
-    browser = await chromium.launch({ headless: true });
+    browser = await chromium.launch({
+      headless: HEADLESS ? true : false,
+      channel: 'chrome',
+    });
     const context = await browser.newContext({ userAgent: UA, locale: 'ja-JP' });
     const page = await context.newPage();
 
-    // 1) 到達
-    await page.goto(phoneUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+    console.log('[post] open:', phoneUrl);
+    const first = await page.goto(phoneUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    console.log('[post] first status:', first ? first.status() : 'none');
 
-    // 2) コメントフォームを厳選
+    // CF対策の小休止（JS challenge等の完了待ち）
+    await page.waitForTimeout(5000);
+    await page.waitForLoadState('networkidle', { timeout: 12000 }).catch(() => {});
+    console.log('[post] after idle');
+
+    // フォーム選定
     const allForms = await page.locator('form').all();
     let formHandle = null;
     let postUrl = null;
 
-    // 優先: action が /phone/.../(post|comments)
     for (const f of allForms) {
       const action = (await f.getAttribute('action')) || '';
       const abs = action ? new URL(action, phoneUrl).toString() : phoneUrl;
-      const path = new URL(abs).pathname;
-      if (/^\/phone\/.+\/(post|comments)$/.test(path)) {
-        formHandle = f;
-        postUrl = abs;
-        break;
-      }
+      if (isPhonePostPath(abs)) { formHandle = f; postUrl = abs; break; }
     }
-
-    // 次善: textarea[name*="comment"] を持ち、/search を含まない
     if (!formHandle) {
       for (const f of allForms) {
         const hasComment = await f.locator('textarea[name*="comment"]').count();
         const action = (await f.getAttribute('action')) || '';
         const abs = action ? new URL(action, phoneUrl).toString() : phoneUrl;
-        if (hasComment && !abs.includes('/search')) {
-          formHandle = f;
-          postUrl = abs;
-          break;
-        }
+        if (hasComment && !abs.includes('/search')) { formHandle = f; postUrl = abs; break; }
       }
     }
-
     if (!formHandle) throw new Error('comment form not found');
+    console.log('[post] picked form action:', postUrl);
 
-    // 3) 入力
+    // 入力
     const cVal = comment || '営業電話';
     const cfVal = callform || '営業電話';
     const rVal = String(rating ?? 1);
@@ -127,20 +126,13 @@ app.post('/post', async (req, res) => {
     const ratingRadio = formHandle.locator(`input[name="phone_rating"][value="${rVal}"]`);
     if (await ratingRadio.isVisible().catch(() => false)) await ratingRadio.check().catch(() => {});
 
-    // 4) 送信：/phone/* の post|comments への POST だけ待受け
-    const respPromise = page.waitForResponse(
-      (r) => {
-        if (r.request().method() !== 'POST') return false;
-        try {
-          const p = new URL(r.url()).pathname;
-          return /^\/phone\/.+\/(post|comments)$/.test(p);
-        } catch { return false; }
-      },
+    // 共通: 指定エンドポイントのPOSTだけ待機
+    const waitPost = () => page.waitForResponse(
+      (r) => r.request().method() === 'POST' && isPhonePostPath(r.url()),
       { timeout: 15000 }
     );
 
     const tryRequestSubmit = async () => {
-      // フォーム要素に requestSubmit()/submit() を安全に適用
       await formHandle.evaluate((node) => {
         const form = node instanceof HTMLFormElement ? node : node.closest('form');
         if (!form) throw new Error('form element not found');
@@ -150,8 +142,17 @@ app.post('/post', async (req, res) => {
       });
     };
 
+    const tryFetchInPage = async () => {
+      return await formHandle.evaluate(async (node, actionAbs) => {
+        const form = node instanceof HTMLFormElement ? node : node.closest('form');
+        if (!form) throw new Error('form not found for fetch');
+        const fd = new FormData(form);
+        const resp = await fetch(actionAbs, { method: 'POST', body: fd, credentials: 'include' });
+        return { status: resp.status, url: resp.url, redirected: resp.redirected };
+      }, postUrl);
+    };
+
     const tryApiFallback = async () => {
-      // 最終手段：フォーム内フィールドを収集して Cookie 同伴で直接 POST
       const payload = await formHandle.evaluate((form) => {
         const data = {};
         const els = form.querySelectorAll('input, textarea, select');
@@ -165,43 +166,79 @@ app.post('/post', async (req, res) => {
       return await context.request.post(postUrl, { form: payload, timeout: 15000 });
     };
 
-    let postResp;
+    let status = 0, location = null;
+
+    // A) 送信ボタンクリック
     try {
       const submitBtn = formHandle
         .locator('input[type="submit"], button[type="submit"], button:has-text("投稿"), text=投稿する')
         .first();
-
       if (await submitBtn.isVisible().catch(() => false)) {
-        // まずはボタンクリック
-        await Promise.all([respPromise, submitBtn.click({ timeout: 15000 })]);
+        const p = waitPost();
+        await submitBtn.click({ timeout: 15000 });
+        const resp = await p;
+        status = resp.status();
+        const h = typeof resp.headers === 'function' ? resp.headers() : (resp.headers || {});
+        location = h['location'] || h['Location'] || null;
+        console.log('[post] click ->', status, location || '');
       } else {
-        // クリック不可 → フォームAPIで送信
-        await Promise.all([respPromise, tryRequestSubmit()]);
+        throw new Error('submit button not visible');
       }
-      postResp = await respPromise;
-    } catch (e) {
-      // クリックも requestSubmit も失敗 → API フォールバック
-      postResp = await tryApiFallback();
+    } catch (_) {}
+
+    // B) requestSubmit/submit
+    if (!(status >= 200 && status < 400)) {
+      try {
+        const p = waitPost();
+        await tryRequestSubmit();
+        const resp = await p;
+        status = resp.status();
+        const h = typeof resp.headers === 'function' ? resp.headers() : (resp.headers || {});
+        location = h['location'] || h['Location'] || null;
+        console.log('[post] requestSubmit ->', status, location || '');
+      } catch (_) {}
     }
 
-    // 5) 3xx は追従して最終ステータス確認
-    let status = postResp.status();
-    const headersObj = typeof postResp.headers === 'function' ? postResp.headers() : (postResp.headers || {});
-    let location = headersObj['location'] || headersObj['Location'] || null;
+    // C) ブラウザ内 fetch(FormData)
+    if (!(status >= 200 && status < 400)) {
+      try {
+        const r = await tryFetchInPage();
+        status = r.status;
+        location = null;
+        console.log('[post] fetch(FormData) ->', status);
+      } catch (_) {}
+    }
 
+    // D) Request API 直POST
+    if (!(status >= 200 && status < 400)) {
+      try {
+        const resp = await tryApiFallback();
+        status = resp.status();
+        const h = typeof resp.headers === 'function' ? resp.headers() : (resp.headers || {});
+        location = h['location'] || h['Location'] || null;
+        console.log('[post] request.post ->', status, location || '');
+      } catch (e) {
+        console.log('[post] request.post error:', String(e));
+      }
+    }
+
+    // 3xx は追従
     if (status >= 300 && status < 400 && location) {
-      const baseUrl = typeof postResp.url === 'function' ? postResp.url() : postUrl;
+      const baseUrl = postUrl;
       const nextUrl = new URL(location, baseUrl).href;
       const follow = await context.request.get(nextUrl, { timeout: 15000 });
       status = follow.status();
+      console.log('[post] follow ->', status);
     }
 
     const ok = status >= 200 && status < 400;
-    res.status(ok ? 200 : 500).json({ ok, status, postUrl, location });
+    console.log('[post] final ->', { ok, status, postUrl, location });
 
+    res.status(ok ? 200 : 500).json({ ok, status, postUrl, location });
     await browser.close();
   } catch (e) {
     if (browser) await browser.close();
+    console.log('[post] error:', e);
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
