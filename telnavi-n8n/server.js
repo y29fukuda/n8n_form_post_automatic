@@ -80,6 +80,28 @@ app.get('/debug', async (_, res) => {
 });
 
 // コメント投稿API
+// /post は「生テキスト」で受けて、こちらでゆるくパースする版
+const textBody = require('express').text({ type: '*/*', limit: '200kb' });
+app.post('/post', textBody, async (req, res, next) => {
+  try {
+    let raw = typeof req.body === 'string' ? req.body : '';
+    // 先頭BOM/改行を除去
+    raw = raw.replace(/^\uFEFF/, '').replace(/^\s+/, '');
+    let body;
+    try {
+      body = raw ? JSON.parse(raw) : {};
+    } catch {
+      // URLエンコードも許容
+      const qs = require('querystring');
+      body = qs.parse(raw || '');
+    }
+    // 既存のハンドラへ渡すため、req.body を上書きして next()
+    req.body = body;
+    return next();
+  } catch (e) {
+    return res.status(400).json({ ok:false, error:'bad request' });
+  }
+});
 app.post('/post', async (req, res) => {
   const { phone, comment, callform, rating } = req.body || {};
   if (!phone) return res.status(400).json({ ok: false, error: 'phone is required' });
