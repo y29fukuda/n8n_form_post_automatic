@@ -112,7 +112,8 @@ app.post('/post', async (req, res) => {
 
   if (!phone) return res.status(400).json({ ok:false, error:'phone is required' });
 
-  const postUrl = `https://www.telnavi.jp/phone/${encodeURIComponent(phone)}/post`;
+  const phoneUrl = `https://www.telnavi.jp/phone/${encodeURIComponent(phone)}`;
+  const postUrl = `${phoneUrl}/post`;
 
   let page;
   try {
@@ -131,8 +132,20 @@ app.post('/post', async (req, res) => {
       } catch { return ''; }
     };
 
-    await page.goto(postUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForSelector('form', { timeout: 15000 });
+    await page.goto(phoneUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+    const onPost = /\/phone\/\d+\/post/.test(page.url());
+    if (!onPost) {
+      const postLink = await page.$('a[href*="/post"], a:has-text("クチコミを書く"), a:has-text("クチコミ")');
+      if (postLink) {
+        await Promise.all([
+          page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
+          postLink.click(),
+        ]);
+      }
+    }
+
+    await page.waitForSelector('form[action*="/post"]', { timeout: 20000 });
 
     // Helper: find input/textarea by heading text near it (robust to class/name changes)
     const findFieldByHeading = async (headingText, selector = 'input, textarea') => {
@@ -157,30 +170,21 @@ app.post('/post', async (req, res) => {
       return handle.asElement();
     };
 
-    // 1) どこからの電話でしたか？
-    const fromInput =
-      (await findFieldByHeading('どこからの電話でしたか？', 'input[type="text"]')) ||
-      (await findFieldByHeading('どこからの電話でしたか',   'input[type="text"]'));
-    if (fromInput && callform) {
-      await fromInput.scrollIntoViewIfNeeded();
-      await fromInput.fill(callform, { timeout: 15000 });
-    }
+    const getCommentTextarea = async () => {
+      const candidates = [
+        '他にも情報があればご記入ください',
+        'クチコミ',
+        '口コミ',
+      ];
+      for (const heading of candidates) {
+        const el = await findFieldByHeading(heading, 'textarea');
+        if (el) return el;
+      }
+      return page.$('form[action*="/post"] textarea');
+    };
 
-    // 2) 電話の目的は何でしたか？（表記ゆれ対応）
-    const purposeInput =
-      (await findFieldByHeading('電話の目的は何でしたか？', 'input[type="text"]')) ||
-      (await findFieldByHeading('電話の目的',               'input[type="text"]'));
-    if (purposeInput && callform) {
-      await purposeInput.scrollIntoViewIfNeeded();
-      await purposeInput.fill(callform, { timeout: 15000 });
-    }
-
-    // 3) 他にも情報があればご記入ください（コメント）
-    const commentArea =
-      (await findFieldByHeading('他にも情報があればご記入ください', 'textarea')) ||
-      (await findFieldByHeading('クチコミ',                         'textarea')) ||
-      (await page.$('form textarea'));
-    if (!commentArea) {
+    const ta = await getCommentTextarea();
+    if (!ta) {
       return res.status(500).json({
         ok:false,
         status: 500,
@@ -188,44 +192,62 @@ app.post('/post', async (req, res) => {
         hint: await htmlSample(),
       });
     }
-    await commentArea.scrollIntoViewIfNeeded();
-    if (comment) await commentArea.fill(comment, { timeout: 15000 });
+    if (ta.scrollIntoViewIfNeeded) await ta.scrollIntoViewIfNeeded();
+    await ta.fill(comment ?? '', { timeout: 20000 });
 
-    // 4) ★評価（label click → fallback: set checked）
-    const tryClickLabel = async () => {
-      const label =
-        (await page.$(`label[for*="phone_rating"][for$="-${rating}"]`)) ||
-        (await page.$(`label[for*="rating"][for$="-${rating}"]`)) ||
-        (await page.locator('label').filter({ hasText: String(rating) }).first());
-      if (label) {
-        await label.scrollIntoViewIfNeeded();
-        await label.click({ timeout: 15000, force: true });
-        return true;
-      }
-      return false;
-    };
-
-    const clicked = await tryClickLabel();
-    if (!clicked) {
-      // directly set the radio input checked
-      await page.evaluate((val) => {
-        const el =
-          document.querySelector(`input[name="phone_rating"][value="${val}"]`) ||
-          document.querySelector(`input[type="radio"][name*="rating"][value="${val}"]`);
-        if (el) {
-          el.checked = true;
-          el.dispatchEvent(new Event('input', { bubbles: true }));
-          el.dispatchEvent(new Event('change', { bubbles: true }));
+    if (callform) {
+      const radioByValue = await page.$(`input[name="callform"][value="${callform}"]`);
+      if (radioByValue) {
+        if (radioByValue.scrollIntoViewIfNeeded) await radioByValue.scrollIntoViewIfNeeded();
+        await radioByValue.check();
+      } else {
+        const label = await page.$(`label:has-text("${callform}")`);
+        if (label) {
+          if (label.scrollIntoViewIfNeeded) await label.scrollIntoViewIfNeeded();
+          await label.click({ force: true });
         }
-      }, String(rating));
+      }
     }
 
-    // 5) 送信
-    const submit =
-      (await page.$('form button[type="submit"]')) ||
-      (await page.$('form input[type="submit"]'))  ||
-      (await page.getByRole('button', { name: /投稿/ }).elementHandle());
-    if (!submit) {
+    if (rating) {
+      const val = String(rating).trim();
+      const r1 = await page.$(`input[name="phone_rating"][value="${val}"]`);
+      if (r1) {
+        if (r1.scrollIntoViewIfNeeded) await r1.scrollIntoViewIfNeeded();
+        await r1.check();
+      } else {
+        const lab = await page.$(`label[for*="phone_rating"]:has-text("${val}")`);
+        if (lab) {
+          if (lab.scrollIntoViewIfNeeded) await lab.scrollIntoViewIfNeeded();
+          await lab.click({ force: true });
+        } else {
+          await page.evaluate((val) => {
+            const el =
+              document.querySelector(`input[name="phone_rating"][value="${val}"]`) ||
+              document.querySelector(`input[type="radio"][name*="rating"][value="${val}"]`);
+            if (el) {
+              el.checked = true;
+              el.dispatchEvent(new Event('input', { bubbles: true }));
+              el.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+          }, val);
+        }
+      }
+    }
+
+    const submitSel = [
+      'form[action*="/post"] button[type="submit"]',
+      'form[action*="/post"] input[type="submit"]',
+      'button[name="postbtn"]',
+      '#go_post',
+      '.go_post_button',
+    ];
+    let submitEl = null;
+    for (const sel of submitSel) {
+      submitEl = await page.$(sel);
+      if (submitEl) break;
+    }
+    if (!submitEl) {
       return res.status(500).json({
         ok:false,
         status: 500,
@@ -233,15 +255,13 @@ app.post('/post', async (req, res) => {
         hint: await htmlSample(),
       });
     }
-    await submit.scrollIntoViewIfNeeded();
-    await submit.click({ timeout: 15000 });
+    if (submitEl.scrollIntoViewIfNeeded) await submitEl.scrollIntoViewIfNeeded();
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {}),
+      submitEl.click({ timeout: 20000 }),
+    ]);
 
-    // 6) 成功待ち: /post を抜ける or 成功メッセージ
-    await Promise.race([
-      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }),
-      page.waitForSelector('text=/投稿ありがとうございました|投稿を受け付けました/', { timeout: 30000 }),
-    ]).catch(() => null);
-
+    await page.waitForLoadState('networkidle').catch(() => {});
     const finalUrl = page.url();
     const ok = !/\/post(?:\?|$)/.test(finalUrl);
 
