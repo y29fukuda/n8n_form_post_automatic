@@ -1,4 +1,3 @@
-2025/10/21-17:53:01.665 5d74 Creating DB C:\Users\user\Desktop\福田ファイル\n8n_form_post_automatic\telnavi-n8n\chrome-profile\Default\shared_proto_db since it was missing.
-2025/10/21-17:53:01.682 5d74 Reusing MANIFEST C:\Users\user\Desktop\福田ファイル\n8n_form_post_automatic\telnavi-n8n\chrome-profile\Default\shared_proto_db/MANIFEST-000001
-2025/10/21-17:53:01.701 5d74 Recovering log #3
-2025/10/21-17:53:01.702 5d74 Reusing old log C:\Users\user\Desktop\福田ファイル\n8n_form_post_automatic\telnavi-n8n\chrome-profile\Default\shared_proto_db/000003.log 
+2025/10/21-19:25:33.637 3864 Reusing MANIFEST C:\Users\user\Desktop\福田ファイル\n8n_form_post_automatic\telnavi-n8n\chrome-profile\Default\shared_proto_db/MANIFEST-000001
+2025/10/21-19:25:33.656 3864 Recovering log #3
+2025/10/21-19:25:33.657 3864 Reusing old log C:\Users\user\Desktop\福田ファイル\n8n_form_post_automatic\telnavi-n8n\chrome-profile\Default\shared_proto_db/000003.log 

@@ -166,58 +166,20 @@ app.post('/post', async (req, res) => {
     });
     page = await context.newPage();
 
-    const BASE = 'https://www.telnavi.jp';
-    const phoneUrl = `${BASE}/phone/${phone}`;
-    const postUrl = `${phoneUrl}/post`;
-    console.log('[post] open:', postUrl);
-
-    await page.goto(postUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-
-    const challengeVisible = await page
-      .locator('text=/Just a moment|verifying your browser|Attention Required/i')
-      .first()
-      .isVisible()
-      .catch(() => false);
-    if (challengeVisible) {
-      console.log('[cf] challenge detected -> wait for navigation');
-      await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 45_000 }).catch(() => {});
-    }
-
-    // --- move to /post and ensure form appears ---
-    {
-      const targetPostUrl = `${BASE}/phone/${phone}/post`;
-
-      if (!page.url().includes('/post')) {
-        await page.goto(targetPostUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        await page.waitForLoadState('networkidle');
-      }
-
-      if (await page.locator(POST_FORM_SEL).count() === 0) {
-        const link = page.locator(POST_LINK_SEL).first();
-        if (await link.count()) {
-          await Promise.all([
-            page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
-            link.click(),
-          ]);
-          await page.waitForLoadState('networkidle');
-        }
-      }
-    }
-
     // --- 移動：/phone → /post（リンクがあればクリック、無ければ直接遷移） ---
-    const phoneLanding = `https://www.telnavi.jp/phone/${phone}`;
-    const postLanding = `https://www.telnavi.jp/phone/${phone}/post`;
+    const phoneUrl = `https://www.telnavi.jp/phone/${phone}`;
+    const postUrl  = `https://www.telnavi.jp/phone/${phone}/post`;
 
-    await page.goto(phoneLanding, { waitUntil: 'domcontentloaded' });
+    await page.goto(phoneUrl, { waitUntil: 'domcontentloaded' });
 
     const postLink = page.locator('a[href$="/post"], a[href*="/post?"]');
     if (await postLink.count()) {
       await Promise.all([
         page.waitForURL(/\/phone\/\d+\/post/),
-        postLink.first().click(),
+        postLink.first().click()
       ]);
     } else {
-      await page.goto(postLanding, { waitUntil: 'domcontentloaded' });
+      await page.goto(postUrl, { waitUntil: 'domcontentloaded' });
     }
 
     await waitCloudflare(page, 120000);
@@ -230,26 +192,22 @@ app.post('/post', async (req, res) => {
     console.log('[post] form action:', actionAttr);
 
     if (callfrom && callfrom.trim()) {
-      const fromBox = form.locator(
-        [
-          'input[name*="from"]',
-          'input[placeholder*="どこから"]',
-          'input[name*="発信"]',
-        ].join(',')
-      );
+      const fromBox = form.locator([
+        'input[name*="from"]',
+        'input[placeholder*="どこから"]',
+        'input[name*="発信"]'
+      ].join(','));
       if (await fromBox.count()) {
         await fromBox.first().fill(callfrom);
       }
     }
 
     if (callform && callform.trim()) {
-      const purposeBox = form.locator(
-        [
-          'input[name*="form"]',
-          'input[name*="目的"]',
-          'input[placeholder*="目的"]',
-        ].join(',')
-      );
+      const purposeBox = form.locator([
+        'input[name*="form"]',
+        'input[name*="目的"]',
+        'input[placeholder*="目的"]'
+      ].join(','));
       if (await purposeBox.count()) {
         await purposeBox.first().fill(callform);
       }
@@ -276,19 +234,17 @@ app.post('/post', async (req, res) => {
     const submitBtn = form.locator('input[type="submit"], button[type="submit"]');
     await Promise.all([
       page.waitForLoadState('domcontentloaded'),
-      submitBtn.first().click(),
+      submitBtn.first().click()
     ]);
 
-    const status = 200;
-    const postUrlResult = page.url();
-    const okText = await page
-      .locator('text=/投稿ありがとうございます|投稿を受け付けました/i')
-      .first()
-      .isVisible()
-      .catch(() => false);
-    const ok = okText || !/\/post(?:$|\?)/.test(postUrlResult);
-    if (!ok) throw new Error('submission did not complete');
-    return res.status(status).json({ ok: true, status, postUrl: postUrlResult });
+    const result = {
+      ok: true,
+      status: 200,
+      postUrl: page.url(),
+      location: await page.title().catch(() => null),
+    };
+    console.log('[post] done ->', result);
+    return res.json(result);
   } catch (e) {
     console.log('[post] error:', e);
     if (page) {
