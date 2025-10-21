@@ -37,7 +37,7 @@ app.get('/debug', async (_, res) => {
   }
 });
 
-// 実ページのフォームを使って投稿（CF/hidden/token/Cookie すべてブラウザ任せ）
+// コメント投稿：実ページの「コメント用フォーム」を厳選して送信
 app.post('/post', async (req, res) => {
   const { phone, comment, callform, rating } = req.body || {};
   if (!phone) return res.status(400).json({ ok: false, error: 'phone is required' });
@@ -50,25 +50,36 @@ app.post('/post', async (req, res) => {
     const context = await browser.newContext({ userAgent: UA, locale: 'ja-JP' });
     const page = await context.newPage();
 
-    // 1) 番号ページへ（CFチャレンジ通過）
+    // 1) ページ到達（CF通過）
     await page.goto(phoneUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
 
-    // 2) コメントフォームを取得（/comments or /post 双方対応）
-    const form = page.locator('form[action*="/comments"], form[action*="/post"], form').first();
-    await form.waitFor({ state: 'visible', timeout: 15000 });
+    // 2) コメントフォームのみを強固に特定（/searchを避ける）
+    const candidateSelectors = [
+      'form[action*="/phone/"][action*="/post"]',
+      'form[action*="/phone/"][action*="/comments"]',
+      'form:has(textarea[name="comment"])',
+      'form:has(textarea[name*="comment"])',
+      'form:has(input[name="phone_rating"])',
+      'form:has(input[name="token"])'
+    ];
+    let form = null;
+    for (const sel of candidateSelectors) {
+      const loc = page.locator(sel);
+      if (await loc.count()) { form = loc.first(); break; }
+    }
+    if (!form) throw new Error('comment form not found');
 
-    // action から POST 先URLを解決
+    // action取得 → 絶対URLに解決
     const actionAttr = await form.getAttribute('action');
     const postUrl = actionAttr ? new URL(actionAttr, phoneUrl).toString() : phoneUrl;
 
-    // 3) フィールドを柔軟に埋める
+    // 3) 入力
     const cVal = comment || '営業電話';
     const cfVal = callform || '営業電話';
     const rVal = String(rating ?? 1);
 
-    const commentSel = 'textarea[name="comment"], textarea#comment, textarea[name*="comment"]';
-    const commentEl = page.locator(commentSel).first();
+    const commentEl = page.locator('textarea[name="comment"], textarea#comment, textarea[name*="comment"]').first();
     if (await commentEl.isVisible().catch(() => false)) await commentEl.fill(cVal);
 
     const nameEl = page.locator('input[name="name"], #name').first();
@@ -81,10 +92,7 @@ app.post('/post', async (req, res) => {
         for (const o of options) {
           const v = (await o.getAttribute('value')) || '';
           const t = (await o.textContent())?.trim() || '';
-          if (v.includes(cfVal) || t.includes(cfVal)) {
-            await selectCF.selectOption(v);
-            break;
-          }
+          if (v.includes(cfVal) || t.includes(cfVal)) { await selectCF.selectOption(v); break; }
         }
       });
     } else {
@@ -106,10 +114,14 @@ app.post('/post', async (req, res) => {
     const ratingRadio = page.locator(`input[name="phone_rating"][value="${rVal}"]`);
     if (await ratingRadio.isVisible().catch(() => false)) await ratingRadio.check().catch(() => {});
 
-    // hidden token はフォーム送信で自動送付される想定
+    // 4) 送信：/phone/* の /post|/comments への POST のみを待受け
+    const respPromise = page.waitForResponse(
+      r => r.request().method() === 'POST'
+        && r.url().includes('/phone/')
+        && (r.url().includes('/post') || r.url().includes('/comments')),
+      { timeout: 15000 }
+    );
 
-    // 4) 送信（POSTのレスポンスを拾う）。リダイレクトは追って最終ステータスを確認
-    const respPromise = context.waitForEvent('response', r => r.url().startsWith(postUrl));
     const submitBtn = page.locator('input[type="submit"], button[type="submit"], text=投稿する').first();
     if (await submitBtn.isVisible().catch(() => false)) {
       await Promise.all([respPromise, submitBtn.click({ timeout: 15000 }).catch(async () => { await form.evaluate(f => f.submit()); })]);
@@ -121,8 +133,9 @@ app.post('/post', async (req, res) => {
     let status = postResp.status();
     let location = postResp.headers()['location'] || null;
 
+    // 3xx は追従して最終ステータスを確認
     if (status >= 300 && status < 400 && location) {
-      const nextUrl = new URL(location, postUrl).href;
+      const nextUrl = new URL(location, postResp.url()).href;
       const follow = await context.request.get(nextUrl, { timeout: 15000 });
       status = follow.status();
     }
