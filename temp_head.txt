@@ -32,7 +32,7 @@ app.use((req, res, next) => {
 });
 
 const PORT = process.env.PORT || 3000;
-const HEADLESS = process.env.HEADLESS === '1'; // 未設定=可視、1=ヘッドレス
+const HEADLESS = process.env.HEADLESS === '1'; // 未設宁E可視、E=ヘッドレス
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const PROFILE_DIR = path.join(process.cwd(), 'chrome-profile');
@@ -132,140 +132,70 @@ app.post('/post', async (req, res) => {
       } catch { return ''; }
     };
 
-    // open target phone page
-    await page.goto(`https://www.telnavi.jp/phone/${phone}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.goto(phoneUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    // move to post form page if not already on it
     const onPost = /\/phone\/\d+\/post/.test(page.url());
     if (!onPost) {
-      const postLink = await page.$('a[href*="/post"], a:has-text("クチコミを書く"), a:has-text("クチコミ")');
+      const postLink = await page.$('a[href*="/post"], a:has-text("クチコミを書ぁE), a:has-text("クチコチE)');
       if (postLink) {
         await Promise.all([
           page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
-          postLink.click()
+          postLink.click(),
         ]);
       }
     }
 
-    // ensure the form exists
     await page.waitForSelector('form[action*="/post"]', { timeout: 20000 });
 
-    // ---- comment ----
-    const getCommentTextarea = async (pageHandle) => {
+    // Helper: find input/textarea by heading text near it (robust to class/name changes)
+    const findFieldByHeading = async (headingText, selector = 'input, textarea') => {
+      const handle = await page.evaluateHandle(({ headingText, selector }) => {
+        const normalize = s => (s || '').replace(/\s+/g, ' ').trim();
+
+        // collect elements that contain the heading text
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+        const boxes = [];
+        while (walker.nextNode()) {
+          const el = walker.currentNode;
+          if (normalize(el.innerText).includes(headingText)) boxes.push(el);
+        }
+        // prefer a control inside the same box
+        for (const box of boxes) {
+          const ctl = box.querySelector(selector);
+          if (ctl) return ctl;
+        }
+        // fallback
+        return document.querySelector(selector);
+      }, { headingText, selector }); // ✁Epass a single object arg
+      return handle.asElement();
+    };
+
+    const getCommentTextarea = async () => {
       const candidates = [
-        '他にも情報があればご記入ください',
-        'クチコミ',
-        '口コミ',
+        '他にも情報があれ�Eご記�Eください',
+        'クチコチE,
+        '口コチE,
       ];
       for (const heading of candidates) {
         const el = await findFieldByHeading(heading, 'textarea');
         if (el) return el;
       }
-      return pageHandle.$('form[action*="/post"] textarea');
+      return page.$('form[action*="/post"] textarea');
     };
-    const ta = await getCommentTextarea(page);
-    if (!ta) throw new Error('comment form not found');
-    await ta.scrollIntoViewIfNeeded?.();
+
+    const ta = await getCommentTextarea();
+    if (!ta) {
+      return res.status(500).json({
+        ok:false,
+        status: 500,
+        error:'comment form not found',
+        hint: await htmlSample(),
+      });
+    }
+    if (ta.scrollIntoViewIfNeeded) await ta.scrollIntoViewIfNeeded();
     await ta.fill(comment ?? '', { timeout: 20000 });
 
-    // ---- call form (営業電話など) ----
     if (callform) {
       const radioByValue = await page.$(`input[name="callform"][value="${callform}"]`);
       if (radioByValue) {
-        await radioByValue.scrollIntoViewIfNeeded?.();
-        await radioByValue.check();
-      } else {
-        const label = await page.$(`label:has-text("${callform}")`);
-        if (label) {
-          await label.scrollIntoViewIfNeeded?.();
-          await label.click({ force: true });
-        }
-      }
-    }
-
-    // ---- rating (1..5) ----
-    if (rating) {
-      const val = String(rating).trim();
-      const r1 = await page.$(`input[name="phone_rating"][value="${val}"]`);
-      if (r1) {
-        await r1.scrollIntoViewIfNeeded?.();
-        await r1.check();
-      } else {
-        const lab = await page.$(`label[for*="phone_rating"]:has-text("${val}")`);
-        if (lab) {
-          await lab.scrollIntoViewIfNeeded?.();
-          await lab.click({ force: true });
-        } else {
-          await page.evaluate((val) => {
-            const el =
-              document.querySelector(`input[name="phone_rating"][value="${val}"]`) ||
-              document.querySelector(`input[type="radio"][name*="rating"][value="${val}"]`);
-            if (el) {
-              el.checked = true;
-              el.dispatchEvent(new Event('input', { bubbles: true }));
-              el.dispatchEvent(new Event('change', { bubbles: true }));
-            }
-          }, val);
-        }
-      }
-    }
-
-    // ---- submit ----
-    const submitSel = [
-      'form[action*="/post"] button[type="submit"]',
-      'form[action*="/post"] input[type="submit"]',
-      'button[name="postbtn"]',
-      '#go_post',
-      '.go_post_button',
-    ];
-    let submitEl = null;
-    for (const sel of submitSel) {
-      submitEl = await page.$(sel);
-      if (submitEl) break;
-    }
-    if (!submitEl) throw new Error('submit button not found');
-    await submitEl.scrollIntoViewIfNeeded?.();
-    await Promise.all([
-      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {}),
-      submitEl.click({ timeout: 20000 })
-    ]);
-
-    await page.waitForLoadState('networkidle').catch(() => {});
-    const finalUrl = page.url();
-    const ok = !/\/post(?:\?|$)/.test(finalUrl);
-
-    if (ok) {
-      return res.status(200).json({
-        ok: true,
-        status: 200,
-        url: finalUrl,
-      });
-    }
-
-    return res.status(500).json({
-      ok:false,
-      status: 500,
-      error: 'submission did not complete',
-      hint: await htmlSample(),
-    });
-  } catch (e) {
-    let hint = '';
-    try {
-      if (page) {
-        hint = await page.evaluate(() => document.body?.innerHTML?.slice(0, 1500) || '');
-      }
-    } catch {}
-    return res.status(500).json({
-      ok:false,
-      status: 500,
-      error: String(e),
-      hint,
-    });
-  } finally {
-    if (browser) await browser.close().catch(()=>{});
-  }
-});
-
-app.listen(PORT, () => {
-  console.log(`TelNavi API running on port ${PORT}`);
-});
+        if (radioByValue.scrollIntoViewIfNeeded) await radioByValue.scrollIntoViewIfNeeded();
