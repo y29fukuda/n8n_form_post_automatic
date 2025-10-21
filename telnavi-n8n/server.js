@@ -135,24 +135,25 @@ app.post('/post', async (req, res) => {
     await page.waitForSelector('form', { timeout: 15000 });
 
     // Helper: find input/textarea by heading text near it (robust to class/name changes)
-    const findFieldByHeading = async (headingText, type = 'input, textarea') => {
-      const handle = await page.evaluateHandle((text, sel) => {
-        // Find the nearest container that contains the heading text
+    const findFieldByHeading = async (headingText, selector = 'input, textarea') => {
+      const handle = await page.evaluateHandle(({ headingText, selector }) => {
+        const normalize = s => (s || '').replace(/\s+/g, ' ').trim();
+
+        // collect elements that contain the heading text
         const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
-        const candidates = [];
+        const boxes = [];
         while (walker.nextNode()) {
           const el = walker.currentNode;
-          const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
-          if (t.includes(text)) candidates.push(el);
+          if (normalize(el.innerText).includes(headingText)) boxes.push(el);
         }
-        // Prefer the closest ancestor with a form control inside
-        for (const box of candidates) {
-          const ctl = box.querySelector(sel);
+        // prefer a control inside the same box
+        for (const box of boxes) {
+          const ctl = box.querySelector(selector);
           if (ctl) return ctl;
         }
-        // fallback: search globally after matching text
-        return document.querySelector(sel);
-      }, headingText, type);
+        // fallback
+        return document.querySelector(selector);
+      }, { headingText, selector }); // ✅ pass a single object arg
       return handle.asElement();
     };
 
