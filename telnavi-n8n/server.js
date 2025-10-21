@@ -56,6 +56,25 @@ async function launchPersistentContext() {
   return context;
 }
 
+async function ensureClearance(context, page) {
+  const hasClearance = async () => {
+    const cookies = await context.cookies('https://www.telnavi.jp');
+    return cookies.some((c) => c.name === 'cf_clearance');
+  };
+  if (await hasClearance()) return;
+  await page.goto('https://www.telnavi.jp/phone/0677122972', { waitUntil: 'domcontentloaded' });
+  console.log('[cf] Waiting for Cloudflare clearance… (max 60s)');
+  const deadline = Date.now() + 60000;
+  while (Date.now() < deadline) {
+    if (await hasClearance()) {
+      console.log('[cf] clearance acquired');
+      return;
+    }
+    await page.waitForTimeout(1000);
+  }
+  console.log('[cf] clearance not acquired (will still try)');
+}
+
 app.get('/healthz', (_, res) => res.json({ ok: true }));
 
 app.get('/debug', async (_, res) => {
@@ -63,6 +82,7 @@ app.get('/debug', async (_, res) => {
   try {
     context = await launchPersistentContext();
     const page = await context.newPage();
+    await ensureClearance(context, page);
     const resp = await page.goto('https://www.telnavi.jp/', {
       waitUntil: 'domcontentloaded',
       timeout: 30000,
@@ -112,6 +132,7 @@ app.post('/post', async (req, res) => {
   try {
     context = await launchPersistentContext();
     const page = await context.newPage();
+    await ensureClearance(context, page);
 
     console.log('[post] open:', phoneUrl);
     const first = await page.goto(phoneUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
@@ -199,22 +220,6 @@ app.post('/post', async (req, res) => {
     const ratingRadio = formHandle.locator(`input[name="phone_rating"][value="${rVal}"]`);
     if (await ratingRadio.isVisible().catch(() => false)) await ratingRadio.check().catch(() => {});
 
-    const waitPost = () =>
-      page.waitForResponse(
-        (r) => r.request().method() === 'POST' && isPhonePostPath(r.url()),
-        { timeout: 15000 },
-      );
-
-    const tryRequestSubmit = async () => {
-      await formHandle.evaluate((node) => {
-        const form = node instanceof HTMLFormElement ? node : node.closest('form');
-        if (!form) throw new Error('form element not found');
-        if (typeof form.requestSubmit === 'function') form.requestSubmit();
-        else if (typeof form.submit === 'function') form.submit();
-        else throw new Error('form.submit not available');
-      });
-    };
-
     const tryFetchInPage = async () => {
       return await formHandle.evaluate(async (node, actionAbs) => {
         const form = node instanceof HTMLFormElement ? node : node.closest('form');
@@ -256,50 +261,61 @@ app.post('/post', async (req, res) => {
     let status = 0;
     let location = null;
 
-    // A) 送信ボタンクリック
+    // 1) ネイティブ form submit（最優先）
     try {
-      const submitBtn = formHandle
-        .locator(
-          'input[type="submit"], input[value="投稿"], input[value="投稿する"], button[type="submit"], button:has-text("投稿"), text=投稿する',
-        )
-        .first();
-      if (await submitBtn.isVisible().catch(() => false)) {
-        const p = waitPost();
-        await submitBtn.click({ timeout: 15000 });
-        const resp = await p;
-        status = resp.status();
-        const headers = typeof resp.headers === 'function' ? resp.headers() : resp.headers || {};
-        location = headers['location'] || headers['Location'] || null;
-        console.log('[post] click ->', status, location || '');
-      } else {
-        throw new Error('submit button not visible');
-      }
-    } catch (_) {}
+      const postUrlGuess = await page.evaluate(() => {
+        const f = document.querySelector('form[action*="/post"]');
+        return f ? new URL(f.getAttribute('action'), location.href).href : null;
+      });
+      console.log('[post] postUrl guess:', postUrlGuess);
 
-    // B) requestSubmit/submit
-    if (!(status >= 200 && status < 400)) {
-      try {
-        const p = waitPost();
-        await tryRequestSubmit();
-        const resp = await p;
-        status = resp.status();
-        const headers = typeof resp.headers === 'function' ? resp.headers() : resp.headers || {};
-        location = headers['location'] || headers['Location'] || null;
-        console.log('[post] requestSubmit ->', status, location || '');
-      } catch (_) {}
+      const waitPost = postUrlGuess
+        ? page.waitForResponse((r) => r.url().startsWith(postUrlGuess), { timeout: 10000 })
+        : page.waitForNavigation({ waitUntil: 'networkidle', timeout: 10000 });
+
+      await page.evaluate(() => {
+        const f = document.querySelector('form[action*="/post"]');
+        if (!f) throw new Error('form not found');
+        if (typeof f.requestSubmit === 'function') {
+          f.requestSubmit();
+        } else {
+          f.submit();
+        }
+      });
+
+      const navOrResp = await waitPost;
+      const postStatus = typeof navOrResp?.status === 'function' ? navOrResp.status() : 200;
+      const postUrlFinal =
+        typeof navOrResp?.url === 'function' ? navOrResp.url() : postUrlGuess || postUrl;
+      console.log('[post] native submit ->', postStatus, postUrlFinal);
+      if (postStatus < 400) {
+        return res.json({ ok: true, status: postStatus, postUrl: postUrlFinal, location: null });
+      }
+      status = postStatus;
+    } catch (e) {
+      console.log('[post] native submit error:', String(e));
     }
 
-    // C) ブラウザ内 fetch(FormData)
+    // 2) fetch(FormData)
     if (!(status >= 200 && status < 400)) {
       try {
         const r = await tryFetchInPage();
         status = r.status;
-        location = null;
-        console.log('[post] fetch(FormData) ->', status);
-      } catch (_) {}
+        console.log('[post] fetch(FormData) ->', status, r.url || '');
+        if (status < 400) {
+          return res.json({
+            ok: true,
+            status,
+            postUrl: r.url || postUrl,
+            location: null,
+          });
+        }
+      } catch (e) {
+        console.log('[post] fetch(FormData) error:', String(e));
+      }
     }
 
-    // D) Request API 直POST
+    // 3) context.request.post
     if (!(status >= 200 && status < 400)) {
       try {
         const resp = await tryApiFallback();
@@ -307,22 +323,24 @@ app.post('/post', async (req, res) => {
         const headers = typeof resp.headers === 'function' ? resp.headers() : resp.headers || {};
         location = headers['location'] || headers['Location'] || null;
         console.log('[post] request.post ->', status, location || '');
+
+        if (status >= 300 && status < 400 && location) {
+          const followUrl = new URL(location, postUrl).href;
+          const follow = await context.request.get(followUrl, { timeout: 15000 });
+          status = follow.status();
+          console.log('[post] follow ->', status);
+        }
+
+        if (status < 400) {
+          return res.json({ ok: true, status, postUrl, location });
+        }
       } catch (e) {
         console.log('[post] request.post error:', String(e));
       }
     }
 
-    if (status >= 300 && status < 400 && location) {
-      const followUrl = new URL(location, postUrl).href;
-      const follow = await context.request.get(followUrl, { timeout: 15000 });
-      status = follow.status();
-      console.log('[post] follow ->', status);
-    }
-
-    const ok = status >= 200 && status < 400;
-    console.log('[post] final ->', { ok, status, postUrl, location });
-
-    res.status(ok ? 200 : 500).json({ ok, status, postUrl, location });
+    console.log('[post] final ->', { ok: false, status, postUrl, location });
+    res.status(500).json({ ok: false, status, postUrl, location });
   } catch (e) {
     console.log('[post] error:', e);
     res.status(500).json({ ok: false, error: String(e) });
