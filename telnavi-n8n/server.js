@@ -3,21 +3,32 @@ const path = require('path');
 const { chromium } = require('playwright');
 
 const app = express();
-app.use(
-  express.json({
-    strict: false,
-    limit: '200kb',
-    type: ['application/json', 'text/plain', 'application/*+json'],
-  }),
-);
-app.use(express.urlencoded({ extended: true, limit: '200kb' }));
-// JSON parse error を握りつぶして 400 を返す
-app.use((err, req, res, next) => {
-  if (err && err.type === 'entity.parse.failed') {
-    console.error('[json-parse-error]', err.message);
-    return res.status(400).json({ ok: false, error: 'bad json' });
-  }
-  next(err);
+// --- parsers (idempotent) ---
+app.use(express.json({ type: ['application/json', 'text/json', 'application/*+json'] }));
+app.use(express.urlencoded({ extended: true }));
+
+// Accept raw JSON even if content-type is wrong or BOM is present.
+app.use((req, res, next) => {
+  if (req.body && Object.keys(req.body).length) return next();
+  let raw = '';
+  req.setEncoding('utf8');
+  req.on('data', (ch) => (raw += ch));
+  req.on('end', () => {
+    raw = (raw || '').replace(/^\uFEFF/, ''); // strip BOM
+    if (!raw) return next();
+    try {
+      req.body = JSON.parse(raw);
+      return next();
+    } catch (_) {
+      try {
+        const p = new URLSearchParams(raw);
+        const obj = {};
+        for (const [k, v] of p.entries()) obj[k] = v;
+        if (Object.keys(obj).length) req.body = obj;
+      } catch {}
+      return next();
+    }
+  });
 });
 
 const PORT = process.env.PORT || 3000;
@@ -77,54 +88,32 @@ async function ensureClearance(context, page) {
 
 app.get('/healthz', (_, res) => res.json({ ok: true }));
 
-app.get('/debug', async (_, res) => {
-  let context;
-  try {
-    context = await launchPersistentContext();
-    const page = await context.newPage();
-    await ensureClearance(context, page);
-    const resp = await page.goto('https://www.telnavi.jp/', {
-      waitUntil: 'domcontentloaded',
-      timeout: 30000,
-    });
-    const status = resp ? resp.status() : 0;
-    res.json({ ok: true, status, telnavi_cf: status === 403 ? 'cloudflare' : null });
-  } catch (e) {
-    console.error('[debug-error]', e);
-    res.status(500).json({ ok: false, error: String(e) });
-  } finally {
-    if (context) {
-      await context.close().catch(() => {});
-    }
-  }
+app.get('/debug', (req, res) => {
+  res.json({
+    ok: true,
+    headers: req.headers,
+    note: 'Use POST /post with body or query',
+  });
 });
 
 // コメント投稿API
-// /post は「生テキスト」で受けて、こちらでゆるくパースする版
-const textBody = require('express').text({ type: '*/*', limit: '200kb' });
-app.post('/post', textBody, async (req, res, next) => {
-  try {
-    let raw = typeof req.body === 'string' ? req.body : '';
-    // 先頭BOM/改行を除去
-    raw = raw.replace(/^\uFEFF/, '').replace(/^\s+/, '');
-    let body;
-    try {
-      body = raw ? JSON.parse(raw) : {};
-    } catch {
-      // URLエンコードも許容
-      const qs = require('querystring');
-      body = qs.parse(raw || '');
-    }
-    // 既存のハンドラへ渡すため、req.body を上書きして next()
-    req.body = body;
-    return next();
-  } catch (e) {
-    return res.status(400).json({ ok:false, error:'bad request' });
-  }
-});
 app.post('/post', async (req, res) => {
-  const { phone, comment, callform, rating } = req.body || {};
-  if (!phone) return res.status(400).json({ ok: false, error: 'phone is required' });
+  // -------- input extraction (fallback to query) --------
+  const payload = req.body && Object.keys(req.body).length ? req.body : req.query;
+  const phone = (payload?.phone ?? '').toString().trim();
+  const comment = (payload?.comment ?? '').toString();
+  const callform = (payload?.callform ?? '').toString();
+  const rating = Number(payload?.rating ?? 1);
+
+  // server-side logging to trace what arrived
+  console.log('[post] headers:', req.headers);
+  console.log('[post] body   :', req.body);
+  console.log('[post] query  :', req.query);
+
+  if (!phone) return res.status(400).json({ ok: false, error: 'phone is required (body or query)' });
+
+  // make sure downstream code reads the normalized variables
+  req.body = { phone, comment, callform, rating };
 
   const phoneUrl = `https://www.telnavi.jp/phone/${encodeURIComponent(phone)}`;
 
