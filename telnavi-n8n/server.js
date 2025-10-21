@@ -25,7 +25,13 @@ app.get('/debug', async (_, res) => {
       headless: HEADLESS ? true : false,
       channel: 'chrome',
     });
-    const context = await browser.newContext({ userAgent: UA, locale: 'ja-JP' });
+    const context = await browser.newContext({ userAgent: UA, locale: 'ja-JP', viewport: { width: 1366, height: 900 } });
+    // Stealth: webdriver を undefined にしてボット判定をかわす
+    await context.addInitScript(() => {
+      try {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      } catch {}
+    });
     const page = await context.newPage();
     const resp = await page.goto('https://www.telnavi.jp/', {
       waitUntil: 'domcontentloaded',
@@ -53,7 +59,13 @@ app.post('/post', async (req, res) => {
       headless: HEADLESS ? true : false,
       channel: 'chrome',
     });
-    const context = await browser.newContext({ userAgent: UA, locale: 'ja-JP' });
+    const context = await browser.newContext({ userAgent: UA, locale: 'ja-JP', viewport: { width: 1366, height: 900 } });
+    // Stealth: webdriver を undefined にしてボット判定をかわす
+    await context.addInitScript(() => {
+      try {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      } catch {}
+    });
     const page = await context.newPage();
 
     console.log('[post] open:', phoneUrl);
@@ -62,7 +74,9 @@ app.post('/post', async (req, res) => {
 
     // CF対策の小休止（JS challenge等の完了待ち）
     await page.waitForTimeout(5000);
-    await page.waitForLoadState('networkidle', { timeout: 12000 }).catch(() => {});
+    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+    // ほんの少し待つ（CF の遅延処理対策）
+    await page.waitForTimeout(500);
     console.log('[post] after idle');
 
     // フォーム選定
@@ -163,15 +177,25 @@ app.post('/post', async (req, res) => {
         }
         return data;
       });
-      return await context.request.post(postUrl, { form: payload, timeout: 15000 });
+      // Referer/Origin を明示（WAF 対策）
+      return await context.request.post(postUrl, {
+        form: payload,
+        headers: {
+          Referer: phoneUrl,
+          Origin: 'https://www.telnavi.jp',
+        },
+        timeout: 20000,
+      });
     };
 
+    // ちょっと人間ぽく：フォームへスクロール＆フォーカス
+    try { await formHandle.scrollIntoViewIfNeeded(); await page.waitForTimeout(200); } catch {}
     let status = 0, location = null;
 
     // A) 送信ボタンクリック
     try {
       const submitBtn = formHandle
-        .locator('input[type="submit"], button[type="submit"], button:has-text("投稿"), text=投稿する')
+        .locator('input[type="submit"], input[value="投稿"], input[value="投稿する"], button[type="submit"], button:has-text("投稿"), text=投稿する')
         .first();
       if (await submitBtn.isVisible().catch(() => false)) {
         const p = waitPost();
