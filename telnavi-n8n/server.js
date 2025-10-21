@@ -36,6 +36,22 @@ const HEADLESS = process.env.HEADLESS === '1'; // 未設定=可視、1=ヘッド
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const PROFILE_DIR = path.join(process.cwd(), 'chrome-profile');
+const userDir = PROFILE_DIR;
+const launchArgs = [];
+
+const sanitize = (body = {}, query = {}) => {
+  const source = { ...query, ...body };
+  const take = (key, fallback = '') => {
+    const raw = source[key];
+    return raw == null ? fallback : String(raw).trim();
+  };
+  return {
+    phone: take('phone'),
+    comment: take('comment', ''),
+    callform: take('callform', ''),
+    rating: take('rating', '1'),
+  };
+};
 
 function isPhonePostPath(urlStr) {
   try {
@@ -127,55 +143,57 @@ app.post('/post', async (req, res) => {
   console.log('[post] body   :', req.body);
   console.log('[post] query  :', req.query);
 
-  const coerce = (key, fallback = '') => {
-    const raw = (req.body?.[key] ?? req.query?.[key] ?? '').toString().trim();
-    return raw || fallback;
-  };
-
-  const phone = coerce('phone');
-  const comment = coerce('comment', '');
-  const callform = coerce('callform', '');
-  const ratingRaw = coerce('rating', '1');
-  const rating = ['1', '2', '3', '4', '5'].includes(ratingRaw) ? ratingRaw : '1';
-
+  const { phone, comment, callform, rating } = sanitize(req.body || {}, req.query || {});
   if (!phone) {
     return res
       .status(400)
       .json({ ok: false, status: 400, error: 'phone is required' });
   }
 
-  let browser;
+  req.setTimeout?.(90_000);
+
+  let context;
   let page;
   try {
-    browser = await chromium.launch({ headless: true });
-    const ctx = await browser.newContext({
-      userAgent: UA,
-      locale: 'ja-JP',
+    context = await chromium.launchPersistentContext(userDir, {
+      headless: false,
+      args: [...launchArgs, '--disable-blink-features=AutomationControlled'],
     });
-    ctx.setDefaultTimeout(45000);
-    ctx.setDefaultNavigationTimeout(60000);
+    page = await context.newPage();
 
-    page = await ctx.newPage();
-    page.setDefaultTimeout(45000);
-    page.setDefaultNavigationTimeout(60000);
+    const phoneUrl = `https://www.telnavi.jp/phone/${phone}`;
+    const postUrl = `${phoneUrl}/post`;
+    console.log('[post] open:', postUrl);
 
-    await page.goto(`https://www.telnavi.jp/phone/${encodeURIComponent(phone)}`, {
-      waitUntil: 'domcontentloaded',
-      timeout: 60000,
-    });
-    await waitCloudflare(page);
+    await page.goto(postUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-    await page.goto(`https://www.telnavi.jp/phone/${encodeURIComponent(phone)}/post`, {
-      waitUntil: 'domcontentloaded',
-      timeout: 60000,
-    });
-    await waitCloudflare(page);
+    const challengeVisible = await page
+      .locator('text=/Just a moment|verifying your browser|Attention Required/i')
+      .first()
+      .isVisible()
+      .catch(() => false);
+    if (challengeVisible) {
+      console.log('[cf] challenge detected -> wait for navigation');
+      await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 45_000 }).catch(() => {});
+    }
 
-    await page.waitForSelector('form[action*="/post"]', {
-      state: 'visible',
-      timeout: 45000,
-    });
-    const form = page.locator('form[action*="/post"]').first();
+    const hasFormInitially = await page.locator('form[action^="/post"]').count();
+    if (!hasFormInitially) {
+      console.log('[post] form not on /post -> try from phone page');
+      await page.goto(phoneUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      const goPost = page
+        .locator('a[href$="/post"], a.go_post_button, a:has-text("口コミを書く"), a:has-text("クチコミを書く")')
+        .first();
+      if (await goPost.count()) {
+        await Promise.all([
+          page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {}),
+          goPost.click({ delay: 50 }),
+        ]);
+      }
+    }
+
+    const form = page.locator('form[action^="/post"]').first();
+    await form.waitFor({ state: 'visible', timeout: 45_000 });
 
     const commentField = await queryVisible(form, [
       'textarea[name="comment"]',
@@ -185,51 +203,69 @@ app.post('/post', async (req, res) => {
       'textarea',
     ]);
     if (!commentField) throw new Error('comment form not found');
-    await commentField.scrollIntoViewIfNeeded();
-    await commentField.fill(comment, { timeout: 45000 });
+    await commentField.scrollIntoViewIfNeeded?.();
+    await commentField.fill(comment ?? '', { timeout: 20_000 });
 
     if (callform) {
       const callformField = await queryVisible(form, [
+        'input[name="callfrom"]',
+        'input[name="callform"]',
         'input[name="post01"]',
         'input[name="title"]',
         'input[type="text"]',
       ]);
       if (callformField) {
-        await callformField.scrollIntoViewIfNeeded();
-        await callformField.fill(callform, { timeout: 45000 });
+        await callformField.scrollIntoViewIfNeeded?.();
+        await callformField.fill(callform, { timeout: 20_000 });
       }
     }
 
-    const ratingLocator = form.locator(`input[type="radio"][name="phone_rating"][value="${rating}"]`);
+    const ratingLocator = form.locator(`input[type="radio"][name="phone_rating"][value="${Number(rating || 1)}"]`);
     if ((await ratingLocator.count()) === 0) throw new Error('rating input not found');
-    const ratingField = ratingLocator.first();
-    await ratingField.waitFor({ state: 'visible', timeout: 45000 });
-    await ratingField.scrollIntoViewIfNeeded();
-    await ratingField.check({ timeout: 45000 });
+    await ratingLocator.first().scrollIntoViewIfNeeded?.();
+    await ratingLocator.first().check({ force: true });
 
-    const submitButton = await queryVisible(form, [
-      'button[type="submit"]',
-      'input[type="submit"]',
+    const submitSel = [
+      'form[action*="/post"] button[type="submit"]',
+      'form[action*="/post"] input[type="submit"]',
+      '#go_post',
+      '.go_post_button',
       'button:has-text("投稿")',
       'input[type="submit"][value*="投稿"]',
-    ]);
-    if (!submitButton) throw new Error('submit button not found');
-    await submitButton.scrollIntoViewIfNeeded();
-
+    ];
+    let submitEl = null;
+    for (const sel of submitSel) {
+      submitEl = await page.$(sel);
+      if (submitEl) break;
+    }
+    if (!submitEl) throw new Error('submit button not found');
+    await submitEl.scrollIntoViewIfNeeded?.();
     await Promise.all([
-      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {}),
-      submitButton.click({ timeout: 45000 }),
-    ]);
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {}),
+      submitEl.click({ timeout: 20_000 }),
+    ]).catch(() => {});
 
-    const finalUrl = page.url();
-    const status = 200;
-    return res.status(status).json({ ok: true, status, postUrl: finalUrl });
-  } catch (err) {
-    console.error('[post] error:', err);
-    const message = err instanceof Error ? err.message : String(err);
+    const okText = await page
+      .locator('text=/投稿ありがとうございます|投稿を受け付けました/i')
+      .first()
+      .isVisible()
+      .catch(() => false);
+    const ok = okText || !/\/post(?:$|\?)/.test(page.url());
+    console.log('[post] final ->', { ok, url: page.url() });
+
+    const status = ok ? 200 : 500;
+    return res.status(status).json({ ok, status, postUrl: page.url() });
+  } catch (e) {
+    console.log('[post] error:', e);
+    if (page) {
+      try {
+        await page.screenshot({ path: 'error-screenshot.png', fullPage: true });
+      } catch {}
+    }
+    const message = e instanceof Error ? e.message : String(e);
     return res.status(500).json({ ok: false, status: 500, error: message });
   } finally {
-    if (browser) await browser.close().catch(() => {});
+    await context?.close().catch(() => {});
   }
 });
 
