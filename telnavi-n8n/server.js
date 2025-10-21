@@ -86,6 +86,58 @@ async function ensureClearance(context, page) {
   console.log('[cf] clearance not acquired (will still try)');
 }
 
+// ----- Cloudflare / フォーム到達を待つヘルパー -----
+async function waitForPostForm(page, totalTimeoutMs = 90000) {
+  const deadline = Date.now() + totalTimeoutMs;
+
+  while (Date.now() < deadline) {
+    const form = await page.$('form[action*="/post"]');
+    if (form) return true;
+
+    const cfWaiting = await page.$(
+      '#challenge-form, .challenge-form, #cf-please-wait, .cf-browser-verification, #cf-chl-widget, [data-cf] , [id*="challenge"]'
+    );
+    if (cfWaiting) {
+      await page.waitForTimeout(1500);
+      continue;
+    }
+
+    await page.waitForLoadState('domcontentloaded').catch(()=>{});
+    await page.waitForTimeout(500);
+  }
+  return false;
+}
+
+async function ensureOnPostPage(page, phone) {
+  await page.goto(`https://www.telnavi.jp/phone/${phone}/post`, {
+    waitUntil: 'domcontentloaded',
+    timeout: 60000,
+  }).catch(()=>{});
+  if (await waitForPostForm(page, 90000)) return true;
+
+  await page.goto(`https://www.telnavi.jp/phone/${phone}`, {
+    waitUntil: 'domcontentloaded',
+    timeout: 60000,
+  }).catch(()=>{});
+  const postLink =
+    (await page.$('a[href*="/post"]')) ||
+    (await page.$('a:has-text("クチコミを書く")')) ||
+    (await page.$('a:has-text("クチコミ")'));
+  if (postLink) {
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(()=>{}),
+      postLink.click({ delay: 50 })
+    ]);
+  }
+  if (await waitForPostForm(page, 90000)) return true;
+
+  await page.goto(`https://www.telnavi.jp/phone/${phone}/post`, {
+    waitUntil: 'domcontentloaded',
+    timeout: 60000,
+  }).catch(()=>{});
+  return await waitForPostForm(page, 90000);
+}
+
 app.get('/healthz', (_, res) => res.json({ ok: true }));
 
 app.get('/debug', (req, res) => {
@@ -132,23 +184,11 @@ app.post('/post', async (req, res) => {
       } catch { return ''; }
     };
 
-    // open target phone page
-    await page.goto(`https://www.telnavi.jp/phone/${phone}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
-
-    // move to post form page if not already on it
-    const onPost = /\/phone\/\d+\/post/.test(page.url());
-    if (!onPost) {
-      const postLink = await page.$('a[href*="/post"], a:has-text("クチコミを書く"), a:has-text("クチコミ")');
-      if (postLink) {
-        await Promise.all([
-          page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
-          postLink.click()
-        ]);
-      }
+    // === フォームページに到達（Cloudflareも自動待機） ===
+    const reached = await ensureOnPostPage(page, phone);
+    if (!reached) {
+      throw new Error('Timeout: Cloudflare clearance / post form not found');
     }
-
-    // ensure the form exists
-    await page.waitForSelector('form[action*="/post"]', { timeout: 20000 });
 
     // ---- comment ----
     const getCommentTextarea = async (pageHandle) => {
@@ -214,9 +254,10 @@ app.post('/post', async (req, res) => {
     const submitSel = [
       'form[action*="/post"] button[type="submit"]',
       'form[action*="/post"] input[type="submit"]',
-      'button[name="postbtn"]',
       '#go_post',
       '.go_post_button',
+      'button:has-text("投稿")',
+      'input[type="submit"][value*="投稿"]'
     ];
     let submitEl = null;
     for (const sel of submitSel) {
