@@ -30,14 +30,14 @@ app.get('/debug', async (_, res) => {
     });
     const status = resp ? resp.status() : 0;
     await browser.close();
-    res.json({ ok: true, status, telnavi_cf: status === 403 ? 'cloudflare' : null, took_ms: null });
+    res.json({ ok: true, status, telnavi_cf: status === 403 ? 'cloudflare' : null });
   } catch (e) {
     if (browser) await browser.close();
     res.status(500).json({ ok: false, error: String(e) });
   }
 });
 
-// コメント投稿：実ページの「コメント用フォーム」を厳選して送信
+// コメント投稿（/phone/* の post/comments のみ）
 app.post('/post', async (req, res) => {
   const { phone, comment, callform, rating } = req.body || {};
   if (!phone) return res.status(400).json({ ok: false, error: 'phone is required' });
@@ -50,42 +50,55 @@ app.post('/post', async (req, res) => {
     const context = await browser.newContext({ userAgent: UA, locale: 'ja-JP' });
     const page = await context.newPage();
 
-    // 1) ページ到達（CF通過）
+    // 1) 到達
     await page.goto(phoneUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
     await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
 
-    // 2) コメントフォームのみを強固に特定（/searchを避ける）
-    const candidateSelectors = [
-      'form[action*="/phone/"][action*="/post"]',
-      'form[action*="/phone/"][action*="/comments"]',
-      'form:has(textarea[name="comment"])',
-      'form:has(textarea[name*="comment"])',
-      'form:has(input[name="phone_rating"])',
-      'form:has(input[name="token"])'
-    ];
-    let form = null;
-    for (const sel of candidateSelectors) {
-      const loc = page.locator(sel);
-      if (await loc.count()) { form = loc.first(); break; }
-    }
-    if (!form) throw new Error('comment form not found');
+    // 2) コメントフォームを厳選
+    const allForms = await page.locator('form').all();
+    let formHandle = null;
+    let postUrl = null;
 
-    // action取得 → 絶対URLに解決
-    const actionAttr = await form.getAttribute('action');
-    const postUrl = actionAttr ? new URL(actionAttr, phoneUrl).toString() : phoneUrl;
+    // 優先: action が /phone/.../(post|comments)
+    for (const f of allForms) {
+      const action = (await f.getAttribute('action')) || '';
+      const abs = action ? new URL(action, phoneUrl).toString() : phoneUrl;
+      const path = new URL(abs).pathname;
+      if (/^\/phone\/.+\/(post|comments)$/.test(path)) {
+        formHandle = f;
+        postUrl = abs;
+        break;
+      }
+    }
+
+    // 次善: textarea[name*="comment"] を持ち、/search を含まない
+    if (!formHandle) {
+      for (const f of allForms) {
+        const hasComment = await f.locator('textarea[name*="comment"]').count();
+        const action = (await f.getAttribute('action')) || '';
+        const abs = action ? new URL(action, phoneUrl).toString() : phoneUrl;
+        if (hasComment && !abs.includes('/search')) {
+          formHandle = f;
+          postUrl = abs;
+          break;
+        }
+      }
+    }
+
+    if (!formHandle) throw new Error('comment form not found');
 
     // 3) 入力
     const cVal = comment || '営業電話';
     const cfVal = callform || '営業電話';
     const rVal = String(rating ?? 1);
 
-    const commentEl = page.locator('textarea[name="comment"], textarea#comment, textarea[name*="comment"]').first();
+    const commentEl = formHandle.locator('textarea[name*="comment"], textarea#comment').first();
     if (await commentEl.isVisible().catch(() => false)) await commentEl.fill(cVal);
 
-    const nameEl = page.locator('input[name="name"], #name').first();
+    const nameEl = formHandle.locator('input[name="name"], #name').first();
     if (await nameEl.isVisible().catch(() => false)) await nameEl.fill('');
 
-    const selectCF = page.locator('select[name="callform"]');
+    const selectCF = formHandle.locator('select[name="callform"]');
     if (await selectCF.isVisible().catch(() => false)) {
       await selectCF.selectOption({ label: cfVal }).catch(async () => {
         const options = await selectCF.locator('option').all();
@@ -96,7 +109,7 @@ app.post('/post', async (req, res) => {
         }
       });
     } else {
-      const radioCF = page.locator('input[type="radio"][name="callform"]');
+      const radioCF = formHandle.locator('input[type="radio"][name="callform"]');
       if (await radioCF.count()) {
         const all = await radioCF.all();
         for (const r of all) {
@@ -106,36 +119,79 @@ app.post('/post', async (req, res) => {
           if (v.includes(cfVal) || labelText.includes(cfVal)) { await r.check().catch(() => {}); break; }
         }
       } else {
-        const textCF = page.locator('input[name="callform"]');
+        const textCF = formHandle.locator('input[name="callform"]');
         if (await textCF.isVisible().catch(() => false)) await textCF.fill(cfVal);
       }
     }
 
-    const ratingRadio = page.locator(`input[name="phone_rating"][value="${rVal}"]`);
+    const ratingRadio = formHandle.locator(`input[name="phone_rating"][value="${rVal}"]`);
     if (await ratingRadio.isVisible().catch(() => false)) await ratingRadio.check().catch(() => {});
 
-    // 4) 送信：/phone/* の /post|/comments への POST のみを待受け
+    // 4) 送信：/phone/* の post|comments への POST だけ待受け
     const respPromise = page.waitForResponse(
-      r => r.request().method() === 'POST'
-        && r.url().includes('/phone/')
-        && (r.url().includes('/post') || r.url().includes('/comments')),
+      (r) => {
+        if (r.request().method() !== 'POST') return false;
+        try {
+          const p = new URL(r.url()).pathname;
+          return /^\/phone\/.+\/(post|comments)$/.test(p);
+        } catch { return false; }
+      },
       { timeout: 15000 }
     );
 
-    const submitBtn = page.locator('input[type="submit"], button[type="submit"], text=投稿する').first();
-    if (await submitBtn.isVisible().catch(() => false)) {
-      await Promise.all([respPromise, submitBtn.click({ timeout: 15000 }).catch(async () => { await form.evaluate(f => f.submit()); })]);
-    } else {
-      await Promise.all([respPromise, form.evaluate(f => f.submit())]);
+    const tryRequestSubmit = async () => {
+      // フォーム要素に requestSubmit()/submit() を安全に適用
+      await formHandle.evaluate((node) => {
+        const form = node instanceof HTMLFormElement ? node : node.closest('form');
+        if (!form) throw new Error('form element not found');
+        if (typeof form.requestSubmit === 'function') form.requestSubmit();
+        else if (typeof form.submit === 'function') form.submit();
+        else throw new Error('form.submit not available');
+      });
+    };
+
+    const tryApiFallback = async () => {
+      // 最終手段：フォーム内フィールドを収集して Cookie 同伴で直接 POST
+      const payload = await formHandle.evaluate((form) => {
+        const data = {};
+        const els = form.querySelectorAll('input, textarea, select');
+        for (const el of els) {
+          if (!el.name) continue;
+          if ((el.type === 'radio' || el.type === 'checkbox') && !el.checked) continue;
+          data[el.name] = el.value ?? '';
+        }
+        return data;
+      });
+      return await context.request.post(postUrl, { form: payload, timeout: 15000 });
+    };
+
+    let postResp;
+    try {
+      const submitBtn = formHandle
+        .locator('input[type="submit"], button[type="submit"], button:has-text("投稿"), text=投稿する')
+        .first();
+
+      if (await submitBtn.isVisible().catch(() => false)) {
+        // まずはボタンクリック
+        await Promise.all([respPromise, submitBtn.click({ timeout: 15000 })]);
+      } else {
+        // クリック不可 → フォームAPIで送信
+        await Promise.all([respPromise, tryRequestSubmit()]);
+      }
+      postResp = await respPromise;
+    } catch (e) {
+      // クリックも requestSubmit も失敗 → API フォールバック
+      postResp = await tryApiFallback();
     }
 
-    let postResp = await respPromise;
+    // 5) 3xx は追従して最終ステータス確認
     let status = postResp.status();
-    let location = postResp.headers()['location'] || null;
+    const headersObj = typeof postResp.headers === 'function' ? postResp.headers() : (postResp.headers || {});
+    let location = headersObj['location'] || headersObj['Location'] || null;
 
-    // 3xx は追従して最終ステータスを確認
     if (status >= 300 && status < 400 && location) {
-      const nextUrl = new URL(location, postResp.url()).href;
+      const baseUrl = typeof postResp.url === 'function' ? postResp.url() : postUrl;
+      const nextUrl = new URL(location, baseUrl).href;
       const follow = await context.request.get(nextUrl, { timeout: 15000 });
       status = follow.status();
     }
