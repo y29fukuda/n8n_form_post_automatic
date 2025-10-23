@@ -1,264 +1,276 @@
+'use strict';
+
 const express = require('express');
-const path = require('path');
 const { chromium } = require('playwright');
+const fs = require('fs');
+const path = require('path');
+const { startTunnel, getTunnelUrl } = require('./tunnel');
 
+const PORT = 3000;
 const app = express();
-// --- parsers (idempotent) ---
-app.use(express.json({ type: ['application/json', 'text/json', 'application/*+json'] }));
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '1mb' }));
 
-// Accept raw JSON even if content-type is wrong or BOM is present.
-app.use((req, res, next) => {
-  if (req.body && Object.keys(req.body).length) return next();
-  let raw = '';
-  req.setEncoding('utf8');
-  req.on('data', (ch) => (raw += ch));
-  req.on('end', () => {
-    raw = (raw || '').replace(/^\uFEFF/, ''); // strip BOM
-    if (!raw) return next();
-    try {
-      req.body = JSON.parse(raw);
-      return next();
-    } catch (_) {
-      try {
-        const p = new URLSearchParams(raw);
-        const obj = {};
-        for (const [k, v] of p.entries()) obj[k] = v;
-        if (Object.keys(obj).length) req.body = obj;
-      } catch {}
-      return next();
-    }
-  });
-});
+const projectRoot = path.resolve(__dirname, '..');
+const baseDir = path.join(projectRoot, 'telnavi-n8n');
+const profileDir = path.join(baseDir, 'chrome-profile');
+const screenshotRelative = 'telnavi-n8n/error-screenshot.png';
+const screenshotPath = path.join(projectRoot, screenshotRelative);
 
-const PORT = process.env.PORT || 3000;
-const HEADLESS = process.env.HEADLESS === '1'; // 未設定=可視、1=ヘッドレス
-const UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-const PROFILE_DIR = path.join(process.cwd(), 'chrome-profile');
-const userDir = PROFILE_DIR;
-const launchArgs = [];
-
-const POST_FORM_SEL = 'form[action$="/post"], #go_post_form';
-const POST_LINK_SEL = 'a[href$="/post"]';
-
-const sanitize = (body = {}, query = {}) => {
-  const source = { ...query, ...body };
-  const take = (key, fallback = '') => {
-    const raw = source[key];
-    return raw == null ? fallback : String(raw).trim();
-  };
-  return {
-    phone: take('phone'),
-    comment: take('comment', ''),
-    callform: take('callform', ''),
-    callfrom: take('callfrom', take('callform', '')),
-    rating: take('rating', '1'),
-  };
-};
-
-function isPhonePostPath(urlStr) {
-  try {
-    const p = new URL(urlStr).pathname;
-    return /^\/phone\/.+\/(post|comments)$/.test(p);
-  } catch {
-    return false;
+function ensureDir(dirPath) {
+  if (!fs.existsSync(dirPath)) {
+    fs.mkdirSync(dirPath, { recursive: true });
   }
 }
 
-async function launchPersistentContext() {
-  const context = await chromium.launchPersistentContext(PROFILE_DIR, {
-    headless: HEADLESS ? true : false,
-    channel: 'chrome',
-    viewport: { width: 1366, height: 900 },
-    userAgent: UA,
-    locale: 'ja-JP',
-    args: [
-      '--disable-blink-features=AutomationControlled',
-      '--no-default-browser-check',
-      '--disable-infobars',
-    ],
-  });
-  await context.addInitScript(() => {
+ensureDir(baseDir);
+ensureDir(profileDir);
+
+let context;
+const activePages = new Set();
+let serverHandle;
+let shuttingDown = false;
+
+function randomDelay(minMs, maxMs) {
+  return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+}
+
+async function waitCloudflare(page, ctx, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  const challengeSelectors = [
+    '#challenge-stage',
+    '.challenge-form',
+    '#cf-please-wait',
+    '.cf-browser-verification',
+    '[data-translate="managed_checking_browser"]',
+  ];
+
+  while (Date.now() < deadline) {
+    const formHandle = await page.$('form[action*="/post"]');
+    if (formHandle) {
+      await formHandle.dispose();
+      return true;
+    }
+
+    let cookies = [];
     try {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    } catch {}
+      cookies = await ctx.cookies('https://www.telnavi.jp');
+    } catch (_) {
+      cookies = [];
+    }
+    if (cookies.some((cookie) => cookie.name === 'cf_clearance')) {
+      return true;
+    }
+
+    for (const selector of challengeSelectors) {
+      const challengeHandle = await page.$(selector);
+      if (challengeHandle) {
+        await challengeHandle.dispose();
+        break;
+      }
+    }
+
+    await page.waitForTimeout(randomDelay(700, 1500));
+  }
+
+  ensureDir(baseDir);
+  try {
+    await page.screenshot({ path: screenshotPath, fullPage: true });
+  } catch (err) {
+    console.error('Failed to capture Cloudflare screenshot:', err);
+  }
+  return false;
+}
+
+async function launchBrowser() {
+  context = await chromium.launchPersistentContext(profileDir, {
+    channel: 'chrome',
+    headless: false,
+    viewport: null,
+    ignoreDefaultArgs: ['--enable-automation'],
+    args: ['--disable-blink-features=AutomationControlled', '--lang=ja-JP'],
   });
+
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'languages', { get: () => ['ja-JP', 'ja'] });
+    Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+    if (!window.chrome) {
+      window.chrome = { runtime: {} };
+    } else if (!window.chrome.runtime) {
+      window.chrome.runtime = {};
+    }
+  });
+
+  await context.setExtraHTTPHeaders({ 'accept-language': 'ja' });
+  context.setDefaultNavigationTimeout(60000);
+  context.setDefaultTimeout(60000);
+
+  const pages = context.pages();
+  if (pages.length) {
+    await Promise.all(
+      pages.map((p) =>
+        p
+          .close()
+          .catch((err) => console.warn('Initial page close failed:', err))
+      )
+    );
+  }
+
   return context;
 }
 
-async function ensureClearance(context, page) {
-  const hasClearance = async () => {
-    const cookies = await context.cookies('https://www.telnavi.jp');
-    return cookies.some((c) => c.name === 'cf_clearance');
-  };
-  if (await hasClearance()) return;
-  await page.goto('https://www.telnavi.jp/phone/0677122972', { waitUntil: 'domcontentloaded' });
-  console.log('[cf] Waiting for Cloudflare clearance… (max 60s)');
-  const deadline = Date.now() + 60000;
-  while (Date.now() < deadline) {
-    if (await hasClearance()) {
-      console.log('[cf] clearance acquired');
-      return;
+const contextReady = launchBrowser().catch((err) => {
+  console.error('Failed to launch browser:', err);
+  throw err;
+});
+
+startTunnel(PORT);
+
+app.get('/health', (_req, res) => {
+  res.json({ ok: true, ts: new Date().toISOString() });
+});
+
+app.get('/tunnel', (_req, res) => {
+  res.json({ url: getTunnelUrl() });
+});
+
+app.post('/post', async (req, res) => {
+  let ctx;
+  try {
+    ctx = await contextReady;
+  } catch (err) {
+    console.error('Browser unavailable:', err);
+    return res
+      .status(500)
+      .json({ ok: false, error: 'Browser initialization failed', shot: screenshotRelative });
+  }
+
+  const { phone, comment, callform, rating } = req.body || {};
+  if (!phone || !comment || !callform || !rating) {
+    return res
+      .status(400)
+      .json({ ok: false, error: 'Missing required fields', shot: screenshotRelative });
+  }
+
+  const sanitizedPhone = String(phone).replace(/[^\d]/g, '');
+  if (!sanitizedPhone) {
+    return res
+      .status(400)
+      .json({ ok: false, error: 'Invalid phone value', shot: screenshotRelative });
+  }
+
+  let page;
+  try {
+    page = await ctx.newPage();
+    activePages.add(page);
+    page.setDefaultNavigationTimeout(60000);
+    page.setDefaultTimeout(60000);
+
+    const homeUrl = 'https://www.telnavi.jp/';
+    await page.goto(homeUrl, { waitUntil: 'load' });
+    await page.waitForTimeout(randomDelay(1200, 2000));
+    await page.mouse.wheel(0, 800);
+    if (!(await waitCloudflare(page, ctx, 60000))) {
+      throw new Error('Cloudflare challenge timeout on home page');
     }
-    await page.waitForTimeout(1000);
-  }
-  console.log('[cf] clearance not acquired (will still try)');
-}
 
-async function waitCloudflare(page, timeoutMs = 10000) {
-  const deadline = Date.now() + timeoutMs;
-  const selector =
-    '#challenge-form, .challenge-form, #cf-please-wait, .cf-browser-verification, #cf-chl-widget, ' +
-    '.cf-wrapper, .cf-im-under-attack, .cf-please-wait, #challenge-error-title';
-  while (Date.now() < deadline) {
-    const challenge = await page.$(selector);
-    if (!challenge) return;
-    await page.waitForTimeout(500);
-  }
-}
+    const phoneUrl = `https://www.telnavi.jp/phone/${encodeURIComponent(sanitizedPhone)}`;
+    await page.goto(phoneUrl, { waitUntil: 'load', referer: homeUrl });
+    await page.waitForTimeout(randomDelay(1000, 1700));
+    await page.mouse.wheel(0, 600);
+    if (!(await waitCloudflare(page, ctx, 60000))) {
+      throw new Error('Cloudflare challenge timeout on phone page');
+    }
 
-async function queryVisible(root, selectors, timeout = 45000) {
-  for (const sel of selectors) {
-    const locator = root.locator(sel).first();
+    const postUrl = `${phoneUrl}/post`;
+    await page.goto(postUrl, { waitUntil: 'load', referer: phoneUrl });
+    if (!(await waitCloudflare(page, ctx, 90000))) {
+      throw new Error('Cloudflare challenge timeout on post page');
+    }
+
+    await page.waitForSelector('form[action*="/post"]', { timeout: 10000 });
+    await page.waitForSelector('textarea[name="comment2"]', { timeout: 10000 });
+    await page.fill('textarea[name="comment2"]', String(comment));
+    await page.waitForSelector('textarea[name="callfrom"]', { timeout: 10000 });
+    await page.fill('textarea[name="callfrom"]', String(callform));
+
+    const ratingSelector = `input[name="phone_rating"][value="${String(rating).trim()}"]`;
+    await page.waitForSelector(ratingSelector, { timeout: 5000 });
+    const ratingHandle = await page.$(ratingSelector);
+    if (!ratingHandle) {
+      throw new Error(`Rating option not found for value ${rating}`);
+    }
+    await ratingHandle.click();
+
+    const submitHandle = await page.$(
+      'form[action*="/post"] input[type="submit"], form[action*="/post"] button[type="submit"]'
+    );
+    if (!submitHandle) {
+      throw new Error('Submit control not found');
+    }
+
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'load', timeout: 60000 }),
+      submitHandle.click(),
+    ]);
+
+    res.json({ ok: true, posturl: page.url() });
+  } catch (err) {
+    console.error('Post workflow failed:', err);
+    res
+      .status(500)
+      .json({ ok: false, error: err.message, shot: screenshotRelative });
+  } finally {
+    if (page) {
+      activePages.delete(page);
+      await page.close().catch(() => {});
+    }
+  }
+});
+
+async function gracefulShutdown(signal) {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
+  console.log(`Received ${signal}, shutting down...`);
+
+  for (const pageInstance of Array.from(activePages)) {
     try {
-      await locator.waitFor({ state: 'visible', timeout });
-      return locator;
-    } catch (_) {
-      continue;
+      await pageInstance.close();
+    } catch (err) {
+      console.error('Failed to close page:', err);
     }
   }
-  return null;
+
+  if (context) {
+    try {
+      await context.close();
+    } catch (err) {
+      console.error('Failed to close context:', err);
+    }
+  }
+
+  if (serverHandle) {
+    const timer = setTimeout(() => process.exit(0), 5000);
+    if (typeof timer.unref === 'function') {
+      timer.unref();
+    }
+    serverHandle.close(() => process.exit(0));
+  } else {
+    process.exit(0);
+  }
 }
 
-app.get('/healthz', (_, res) => res.json({ ok: true }));
-
-app.get('/debug', (req, res) => {
-  res.json({
-    ok: true,
-    headers: req.headers,
-    note: 'Use POST /post with body or query',
+['SIGINT', 'SIGTERM'].forEach((signal) => {
+  process.on(signal, () => {
+    gracefulShutdown(signal).catch((err) => {
+      console.error('Shutdown error:', err);
+      process.exit(1);
+    });
   });
 });
 
-// コメント投稿API
-app.post('/post', async (req, res) => {
-  res.type('application/json');
-  console.log('[post] headers:', req.headers);
-  console.log('[post] body   :', req.body);
-  console.log('[post] query  :', req.query);
-
-  const { phone, comment, callform, callfrom, rating } = sanitize(req.body || {}, req.query || {});
-  if (!phone) {
-    return res
-      .status(400)
-      .json({ ok: false, status: 400, error: 'phone is required' });
-  }
-
-  req.setTimeout?.(90_000);
-
-  let context;
-  let page;
-  try {
-    context = await chromium.launchPersistentContext(userDir, {
-      headless: false,
-      args: [...launchArgs, '--disable-blink-features=AutomationControlled'],
-    });
-    page = await context.newPage();
-
-    // --- 移動：/phone → /post（リンクがあればクリック、無ければ直接遷移） ---
-    const phoneUrl = `https://www.telnavi.jp/phone/${phone}`;
-    const postUrl  = `https://www.telnavi.jp/phone/${phone}/post`;
-
-    await page.goto(phoneUrl, { waitUntil: 'domcontentloaded' });
-
-    const postLink = page.locator('a[href$="/post"], a[href*="/post?"]');
-    if (await postLink.count()) {
-      await Promise.all([
-        page.waitForURL(/\/phone\/\d+\/post/),
-        postLink.first().click()
-      ]);
-    } else {
-      await page.goto(postUrl, { waitUntil: 'domcontentloaded' });
-    }
-
-    await waitCloudflare(page, 120000);
-
-    const form = page.locator('form[action*="/post"]').first();
-    await form.waitFor({ state: 'visible', timeout: 60000 });
-    await form.scrollIntoViewIfNeeded();
-
-    const actionAttr = await form.getAttribute('action');
-    console.log('[post] form action:', actionAttr);
-
-    if (callfrom && callfrom.trim()) {
-      const fromBox = form.locator([
-        'input[name*="from"]',
-        'input[placeholder*="どこから"]',
-        'input[name*="発信"]'
-      ].join(','));
-      if (await fromBox.count()) {
-        await fromBox.first().fill(callfrom);
-      }
-    }
-
-    if (callform && callform.trim()) {
-      const purposeBox = form.locator([
-        'input[name*="form"]',
-        'input[name*="目的"]',
-        'input[placeholder*="目的"]'
-      ].join(','));
-      if (await purposeBox.count()) {
-        await purposeBox.first().fill(callform);
-      }
-    }
-
-    const commentArea = form.locator('textarea[name="comment"], textarea[name*="comment"]');
-    if (await commentArea.count()) {
-      await commentArea.first().fill(comment || '');
-    } else {
-      throw new Error('comment textarea not found');
-    }
-
-    if (rating != null) {
-      const ratingStr = String(rating);
-      const ratingRadio = form.locator(`input[type="radio"][name$="rating"][value="${ratingStr}"]`);
-      if (await ratingRadio.count()) {
-        await ratingRadio.first().check({ force: true });
-      } else {
-        const anyRating = form.locator('input[type="radio"][name$="rating"]');
-        if (await anyRating.count()) await anyRating.first().check({ force: true });
-      }
-    }
-
-    const submitBtn = form.locator('input[type="submit"], button[type="submit"]');
-    await Promise.all([
-      page.waitForLoadState('domcontentloaded'),
-      submitBtn.first().click()
-    ]);
-
-    const result = {
-      ok: true,
-      status: 200,
-      postUrl: page.url(),
-      location: await page.title().catch(() => null),
-    };
-    console.log('[post] done ->', result);
-    return res.json(result);
-  } catch (e) {
-    console.log('[post] error:', e);
-    if (page) {
-      try {
-        await page.screenshot({ path: 'error-screenshot.png', fullPage: true });
-      } catch {}
-    }
-    const message = e instanceof Error ? e.message : String(e);
-    return res.status(500).json({ ok: false, status: 500, error: message });
-  } finally {
-    await context?.close().catch(() => {});
-  }
-});
-
-app.listen(PORT, () => {
-  console.log(`TelNavi API running on port ${PORT}`);
+serverHandle = app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
 });

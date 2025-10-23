@@ -172,7 +172,7 @@ app.post('/post', async (req, res) => {
 
     const getCommentTextarea = async () => {
       const candidates = [
-        '他にも情報があれ�Eご記�Eください',
+        '他にも情報があれ�Eご記�Eください',
         'クチコチE,
         '口コチE,
       ];
