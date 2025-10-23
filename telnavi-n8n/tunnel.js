@@ -1,101 +1,51 @@
 'use strict';
-
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const fsp = fs.promises;
-const projectRoot = path.resolve(__dirname, '..');
-const baseDir = path.join(projectRoot, 'telnavi-n8n');
-const tunnelFile = path.join(baseDir, 'tunnel-url.txt');
+const PORT = process.env.PORT || 3000;
+const TUNNEL_FILE = path.join(__dirname, 'tunnel-url.txt');
 
-function ensureDir(dirPath) {
-  if (!fs.existsSync(dirPath)) {
-    fs.mkdirSync(dirPath, { recursive: true });
+/** cloudflared の実体パスを決める */
+function resolveCloudflaredPath() {
+  if (process.env.CLOUDFLARED_PATH) return process.env.CLOUDFLARED_PATH;
+  const candidates = [
+    'C:\\Program Files\\cloudflared\\cloudflared.exe',
+    'C:\\Program Files\\Cloudflare\\cloudflared\\cloudflared.exe',
+    path.join(process.env.LOCALAPPDATA || '', 'Cloudflare', 'cloudflared', 'cloudflared.exe'),
+    'cloudflared', // PATH
+  ];
+  for (const p of candidates) {
+    try {
+      if (p === 'cloudflared') return p;
+      if (fs.existsSync(p)) return p;
+    } catch (_) {}
   }
+  throw new Error('cloudflared 実行ファイルが見つかりません。CLOUDFLARED_PATH を設定するか、scripts/install-cloudflared.ps1 を実行してください。');
 }
 
-ensureDir(baseDir);
+function startTunnel() {
+  const bin = resolveCloudflaredPath();
+  const args = [
+    'tunnel',
+    '--url', `http://127.0.0.1:${PORT}`,
+    '--no-autoupdate',
+  ];
+  const proc = spawn(bin, args, { shell: true });
 
-let currentProcess = null;
-let currentUrl = null;
-let restartTimer = null;
-
-async function writeTunnelFile(url) {
-  try {
-    await fsp.writeFile(tunnelFile, url ? `${url}\n` : '');
-  } catch (err) {
-    console.error('Failed to write tunnel URL file:', err);
-  }
-}
-
-function spawnTunnel(port) {
-  const child = spawn(
-    'cloudflared',
-    ['tunnel', '--url', `http://localhost:${port}`, '--no-autoupdate'],
-    { stdio: ['ignore', 'pipe', 'pipe'] }
-  );
-
-  child.stdout.setEncoding('utf8');
-  child.stdout.on('data', (chunk) => {
-    const matches = chunk.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/gi);
-    if (matches && matches.length) {
-      const url = matches[matches.length - 1];
-      if (url !== currentUrl) {
-        currentUrl = url;
-        console.log(`[tunnel] ${url}`);
-        writeTunnelFile(url);
-      }
+  proc.stdout.on('data', (buf) => {
+    const s = buf.toString();
+    process.stdout.write('[tunnel] ' + s);
+    const m = s.match(/https?:\/\/[^\s]*trycloudflare\.com\/?/i);
+    if (m) {
+      const url = m[0].trim().replace(/[\u0000-\u001F]+/g, '');
+      fs.writeFileSync(TUNNEL_FILE, url);
+      console.log('[tunnel] URL ->', url);
     }
   });
-
-  child.stderr.setEncoding('utf8');
-  child.stderr.on('data', (chunk) => {
-    const line = chunk.trim();
-    if (line) {
-      console.error(`[tunnel] ${line}`);
-    }
-  });
-
-  child.on('exit', (code, signal) => {
-    console.warn(`[tunnel] exited (code=${code}, signal=${signal})`);
-    currentProcess = null;
-    currentUrl = null;
-    writeTunnelFile('');
-    restartTimer = setTimeout(() => {
-      restartTimer = null;
-      currentProcess = spawnTunnel(port);
-    }, 3000);
-  });
-
-  child.on('error', (err) => {
-    console.error(`[tunnel] failed to start: ${err.message}`);
-  });
-
-  return child;
+  proc.stderr.on('data', (buf) => process.stderr.write('[tunnel:err] ' + buf.toString()));
+  proc.on('exit', (code) => console.log('[tunnel] exited:', code));
 }
 
-function startTunnel(port) {
-  if (currentProcess) {
-    return currentProcess;
-  }
-  if (restartTimer) {
-    clearTimeout(restartTimer);
-    restartTimer = null;
-  }
-  writeTunnelFile('');
-  currentProcess = spawnTunnel(port);
-  return currentProcess;
-}
-
-function getTunnelUrl() {
-  return currentUrl;
-}
-
-process.on('exit', () => {
-  if (currentProcess && currentProcess.exitCode === null) {
-    currentProcess.kill();
-  }
-});
-
-module.exports = { startTunnel, getTunnelUrl };
+if (require.main === module) startTunnel();
+module.exports = { startTunnel };

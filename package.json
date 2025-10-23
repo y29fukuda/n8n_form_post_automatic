@@ -1,0 +1,14 @@
+{
+  "name": "n8n-form-post-automatic",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "serve-only": "node telnavi-n8n/server.js",
+    "tunnel-only": "node -e \"require('./telnavi-n8n/tunnel').startTunnel()\"",
+    "start": "node telnavi-n8n/server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "playwright": "^1.48.2"
+  }
+}
