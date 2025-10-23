@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "express": "^4.19.2",
-    "playwright": "^1.48.2"
+    "playwright": "^1.48.2",
+    "undici": "^6.2.1"
   }
 }

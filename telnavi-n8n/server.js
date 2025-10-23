@@ -1,13 +1,11 @@
 'use strict';
 
 const express = require('express');
-const path = require('path');
-const { chromium } = require('playwright');
+// NOTE: Playwright は使用せず、undici を用いて HTTP ベースで投稿します。
+const { request } = require('undici');
 const { startTunnel } = require('./tunnel');
 
 const PORT = process.env.PORT || 3000;
-const HEADLESS = (process.env.HEADLESS ?? 'false').toLowerCase() !== 'false'; // 初回は false 推奨
-const CF_WAIT_MS = Number(process.env.WAIT_CF_MS || 120000);
 
 const app = express();
 app.use(express.json());
@@ -42,99 +40,76 @@ app.listen(PORT, () => {
   console.log(`TelNavi API running on port ${PORT}`);
 });
 
-/** Cloudflare待ち：チャレンジが消え、投稿フォームが見えるまで粘る */
-async function waitCloudflare(page, timeoutMs = CF_WAIT_MS) {
-  const deadline = Date.now() + timeoutMs;
-  const challengeSel = [
-    '#challenge-form',
-    '.challenge-form',
-    '#cf-browser-verification',
-    '.cf-browser-verification',
-    '[data-cf] .hcaptcha-box',
-    '#turnstile-wrapper',
-    '#cf-please-wait',
-    '.cf-chl-widget',
-  ].join(',');
-
-  while (Date.now() < deadline) {
-    const hasChallenge = await page.locator(challengeSel).first().isVisible().catch(() => false);
-    const hasForm = await page.locator('form[action^="/post"]').first().isVisible().catch(() => false);
-    if (!hasChallenge && hasForm) return true;
-    await page.waitForTimeout(1200);
+/**
+ * テレナビの電話番号ページに GET リクエストを送り、hidden フィールドの token と
+ * Cookie の PHPSESSID を抽出する。
+ */
+async function fetchTokenAndCookie(phone) {
+  const url = `https://www.telnavi.jp/phone/${encodeURIComponent(phone)}/`;
+  const res = await request(url, {
+    method: 'GET',
+    headers: {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
+      Accept:
+        'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+      'Cache-Control': 'no-cache',
+      Pragma: 'no-cache',
+      'Upgrade-Insecure-Requests': '1',
+    },
+  });
+  const html = await res.body.text();
+  const setCookies = res.headers['set-cookie'] || res.headers['Set-Cookie'] || [];
+  // token を抽出する (<input type="hidden" name="token" value="...">)
+  const m = html.match(/name=["']token["']\s+value=["']([^"']+)["']/i);
+  if (!m) throw new Error('token がページから取得できませんでした');
+  const token = m[1];
+  // PHPSESSID を抽出
+  let phpsessid = '';
+  const cookieArr = Array.isArray(setCookies) ? setCookies : [setCookies];
+  for (const c of cookieArr) {
+    const mm = /PHPSESSID=([^;]+)/.exec(c);
+    if (mm) {
+      phpsessid = mm[1];
+      break;
+    }
   }
-  throw new Error('Cloudflare challenge timeout');
+  if (!phpsessid) throw new Error('PHPSESSID がレスポンスCookieから取得できませんでした');
+  return { token, phpsessid };
 }
 
-/** 実処理：テレナビに投稿 */
+/**
+ * 抽出した token と PHPSESSID を使ってテレナビへ投稿する。
+ */
 async function postToTelnavi({ phone, comment, callform, rating }) {
-  const profileDir = path.resolve(__dirname, 'chrome-profile');
-  const context = await chromium.launchPersistentContext(profileDir, {
-    channel: 'chrome', // 検出回避のため Chrome を使う
-    headless: HEADLESS,
-    viewport: null,
-    ignoreDefaultArgs: ['--enable-automation'],
-    args: [
-      '--start-maximized',
-      '--disable-blink-features=AutomationControlled',
-    ],
+  const { token, phpsessid } = await fetchTokenAndCookie(phone);
+  // フォームデータを組み立て (callform を callfrom として使用し、callPurpose は "3" 固定)
+  const form = new URLSearchParams();
+  form.set('callfrom', callform || '営業電話');
+  form.set('callPurpose', '3');
+  form.set('phone_rating', String(rating || '1'));
+  form.set('comment', comment || '');
+  form.set('agreement', '1');
+  form.set('token', token);
+  form.set('submit', '投稿する');
+  const url = `https://www.telnavi.jp/phone/${encodeURIComponent(phone)}/post`;
+  const res = await request(url, {
+    method: 'POST',
+    headers: {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
+      Referer: `https://www.telnavi.jp/phone/${encodeURIComponent(phone)}/`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Cookie: `PHPSESSID=${phpsessid}`,
+      Accept:
+        'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+    },
+    body: form.toString(),
   });
-
-  // webdriver フラグ除去
-  context.addInitScript(() => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-  });
-
-  const page = await context.newPage();
-  const phoneUrl = `https://www.telnavi.jp/phone/${encodeURIComponent(phone)}`;
-  console.log('[post] open:', phoneUrl);
-
-  try {
-    await page.goto(phoneUrl, { waitUntil: 'domcontentloaded', timeout: 120000 });
-    await waitCloudflare(page, CF_WAIT_MS);
-
-    const form = page.locator('form[action^="/post"]').first();
-    await form.waitFor({ state: 'visible', timeout: 60000 });
-
-    // テキスト/テキストエリアの入力
-    const selComment = 'textarea[name="comment"], textarea#comment';
-    const selCall    = 'input[name="callform"], input#callform, textarea[name="callform"]';
-
-    if (comment) {
-      if (await page.locator(selComment).count())
-        await page.fill(selComment, comment);
-    }
-    if (callform) {
-      if (await page.locator(selCall).count())
-        await page.fill(selCall, callform);
-    }
-
-    // 星（rating）
-    const rateSel = `input[type="radio"][name="phone_rating"][value="${String(rating || '1')}"]`;
-    if (await page.locator(rateSel).count()) {
-      await page.locator(rateSel).first().check({ force: true });
-    }
-
-    // 同意チェックボックスがあればON
-    const agreeSel = 'input[name="agreement"], input#agreement';
-    if (await page.locator(agreeSel).count()) {
-      const t = await page.locator(agreeSel).first().getAttribute('type');
-      if (t === 'checkbox') await page.locator(agreeSel).first().check().catch(() => {});
-    }
-
-    // 送信
-    const submitSel = 'input[type="submit"], button[type="submit"]';
-    await page.locator(submitSel).first().click({ delay: 50 });
-    await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => {});
-    console.log('[post] done');
-
-  } catch (e) {
-    console.error('Call log:\n', e?.stack || e);
-    try {
-      await page.screenshot({ path: path.join(__dirname, 'error-screenshot.png'), fullPage: true });
-      console.log('[post] error screenshot saved: telnavi-n8n/error-screenshot.png');
-    } catch (_) {}
-    throw e; // 上位へ
-  } finally {
-    await context.close();
+  if (res.statusCode >= 400) {
+    const text = await res.body.text();
+    throw new Error(`投稿に失敗しました: ${res.statusCode} ${text}`);
   }
 }
