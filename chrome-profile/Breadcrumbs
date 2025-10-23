@@ -1,0 +1,42 @@
+0:00:05 Tab2 PageLoad
+0:00:05 Tab2 StartNav49 #renderer-script #auto_subframe
+0:00:05 Tab2 FinishNav49
+0:00:05 Tab2 PageLoad
+0:00:05 Tab2 StartNav50 #renderer-user #auto_subframe
+0:00:05 Tab2 StartNav51 #google #renderer-user #auto_subframe
+0:00:05 Tab2 FinishNav50
+0:00:05 Tab2 PageLoad
+0:00:05 Tab2 FinishNav51
+0:00:05 Tab2 PageLoad #google
+0:00:05 Tab2 PageLoad
+0:00:05 Tab2 PageLoad
+0:00:05 Tab2 PageLoad
+0:00:05 Tab2 PageLoad
+0:00:05 Tab2 PageLoad
+0:00:05 Tab2 PageLoad
+0:00:05 Tab2 PageLoad
+0:00:05 Tab2 StartNav52 #renderer-script #auto_subframe
+0:00:05 Tab2 FinishNav52
+0:00:05 Tab2 PageLoad
+0:00:05 Tab2 PageLoad
+0:00:05 Tab2 PageLoad
+0:00:05 Tab2 PageLoad
+0:00:05 Tab2 PageLoad
+0:00:06 Tab2 StartNav53 #renderer-script #auto_subframe
+0:00:06 Tab2 FinishNav53
+0:00:06 Tab2 PageLoad
+0:00:06 Tab2 StartNav54 #renderer-script #auto_subframe
+0:00:06 Tab2 FinishNav54
+0:00:06 Tab2 PageLoad
+0:00:12 Tab2 StartNav55 #renderer-script #auto_subframe
+0:00:12 Tab2 FinishNav55
+0:00:12 Tab2 PageLoad
+0:00:12 Tab2 StartNav56 #renderer-script #auto_subframe
+0:00:12 Tab2 FinishNav56
+0:00:12 Tab2 PageLoad
+0:00:25 Widget Closed: StatusBubble
+0:02:04 Tab1 RemoveInfobar43
+0:02:04 Tab1 RenderProcessGone
+0:02:04 Browser1 Closed 2 tabs
+0:02:04 Widget Closed: BrowserFrame
+0:02:04 Widget Closed: BrowserFrame
