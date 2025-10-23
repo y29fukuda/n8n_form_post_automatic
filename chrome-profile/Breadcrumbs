@@ -1,66 +1,45 @@
-0:00:05 Tab2 PageLoad
-0:00:05 Tab2 StartNav49 #renderer-script #auto_subframe
-0:00:05 Tab2 FinishNav49
-0:00:05 Tab2 PageLoad
-0:00:05 Tab2 StartNav50 #renderer-user #auto_subframe
-0:00:05 Tab2 StartNav51 #google #renderer-user #auto_subframe
-0:00:05 Tab2 FinishNav50
-0:00:05 Tab2 PageLoad
-0:00:05 Tab2 FinishNav51
-0:00:05 Tab2 PageLoad #google
-0:00:05 Tab2 PageLoad
-0:00:05 Tab2 PageLoad
-0:00:05 Tab2 PageLoad
-0:00:05 Tab2 PageLoad
-0:00:05 Tab2 PageLoad
-0:00:05 Tab2 PageLoad
-0:00:05 Tab2 PageLoad
-0:00:05 Tab2 StartNav52 #renderer-script #auto_subframe
-0:00:05 Tab2 FinishNav52
-0:00:05 Tab2 PageLoad
-0:00:05 Tab2 PageLoad
-0:00:05 Tab2 PageLoad
-0:00:05 Tab2 PageLoad
-0:00:05 Tab2 PageLoad
-0:00:06 Tab2 StartNav53 #renderer-script #auto_subframe
-0:00:06 Tab2 FinishNav53
-0:00:06 Tab2 PageLoad
-0:00:06 Tab2 StartNav54 #renderer-script #auto_subframe
-0:00:06 Tab2 FinishNav54
-0:00:06 Tab2 PageLoad
-0:00:12 Tab2 StartNav55 #renderer-script #auto_subframe
-0:00:12 Tab2 FinishNav55
-0:00:12 Tab2 PageLoad
-0:00:12 Tab2 StartNav56 #renderer-script #auto_subframe
-0:00:12 Tab2 FinishNav56
-0:00:12 Tab2 PageLoad
+0:00:05 Tab1 PageLoad
+0:00:05 Tab1 FinishNav33
+0:00:05 Tab1 StartNav34 #renderer-script #auto_subframe
+0:00:05 Tab1 FinishNav34
+0:00:05 Tab1 PageLoad
+0:00:05 Tab1 PageLoad
+0:00:05 Tab1 StartNav35 #renderer-script #auto_subframe
+0:00:05 Tab1 StartNav36 #google #renderer-script #auto_subframe
+0:00:05 Tab1 StartNav37 #renderer-script #auto_subframe
+0:00:05 Tab1 StartNav38 #google #renderer-script #auto_subframe
+0:00:05 Tab1 FinishNav36
+0:00:05 Tab1 FinishNav38
+0:00:05 Tab1 PageLoad #google
+0:00:05 Tab1 PageLoad #google
+0:00:05 Tab1 FinishNav35
+0:00:05 Tab1 FinishNav29
+0:00:05 Tab1 FinishNav37
+0:00:06 Tab1 PageLoad
+0:00:06 Tab1 PageLoad
+0:00:06 Tab1 StartNav39 #renderer-script #auto_subframe
+0:00:06 Tab1 FinishNav39
+0:00:06 Tab1 PageLoad
+0:00:06 Tab1 PageLoad
+0:00:06 Tab1 PageLoad
+0:00:06 Tab1 StartNav40 #renderer-script #auto_subframe
+0:00:06 Tab1 FinishNav40
+0:00:06 Tab1 PageLoad
+0:00:14 DevTools_ToggleWindow
+0:00:14 DevTools_InspectRenderer
+0:00:15 DevTools_PanelShown_elements
+0:00:19 Widget Closed: BubbleDialogModelHostContentsView
+0:00:22 Widget Closed: MenuHost
+0:00:22 DevTools_PanelShown_resources
+0:00:22 DevTools_PanelShown_app-manifest
+0:00:23 DevTools_PanelShown_trust-tokens
+0:00:25 DevTools_PanelShown_cookies
 0:00:25 Widget Closed: StatusBubble
-0:02:04 Tab1 RemoveInfobar43
-0:02:04 Tab1 RenderProcessGone
-0:02:04 Browser1 Closed 2 tabs
-0:02:04 Widget Closed: BrowserFrame
-0:02:04 Widget Closed: BrowserFrame
-0:00:00 Startup
-0:00:00 Tab1 StartNav1 #auto_toplevel
-0:00:00 Browser1 Insert active Tab1 at 0
-0:00:00 Tab1 AddInfobar43
-0:00:00 TouchMode.EnteredNonTouchMode
-0:00:00 Tab1 FinishNav1
-0:00:00 Tab1 PageLoad
-0:00:00 Tab2 StartNav2 #auto_toplevel
-0:00:00 Browser1 Insert active Tab2 at 1
-0:00:00 Tab2 FinishNav2
-0:00:00 Tab2 PageLoad
-0:00:00 Tab2 StartNav3 #typed
-0:00:01 Tab2 FinishNav3
-0:00:01 Tab2 StartNav4 #renderer-script #auto_subframe
-0:00:01 Tab2 FinishNav4
-0:00:01 Tab2 PageLoad
-0:00:01 Tab2 StartNav5 #renderer-script #auto_subframe
-0:00:01 Tab2 FinishNav5
-0:00:01 Tab2 PageLoad
-0:00:02 Tab2 PageLoad
-0:01:02 Tab2 StartNav6 #renderer-user #auto_subframe
-0:01:02 Tab2 FinishNav6
-0:01:02 Tab2 PageLoad
-0:02:02 Tab1 RemoveInfobar43
+0:00:27 TextSelectionChanged
+0:00:28 TextSelectionChanged
+0:00:29 TextSelectionChanged
+0:00:29 TextSelectionChanged
+0:00:39 Browser1 Close Tab1 at 0
+0:00:39 Widget Closed: BrowserFrame
+0:00:39 DevTools_Close
+0:00:39 Shutdown
