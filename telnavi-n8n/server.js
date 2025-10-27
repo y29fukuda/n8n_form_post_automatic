@@ -48,6 +48,74 @@ async function openPersistentContext() {
   return { context, page };
 }
 
+// 新: フォームを埋めて送信する処理（2025/10/27版）
+//
+// 電話帳ナビの現在の投稿フォーム仕様:
+//   1. 大きいテキストエリア（「他にも情報があればご記入ください」）が1つ
+//   2. 「電話相手の総合評価(必須)」の★評価
+//      → <input name="rating" type="radio" value="1".. "5"> 形式 or
+//         input+labelの★をクリックするタイプ
+//   3. 「書き込む」ボタン
+//
+// 重要: 昔あった "callform" ラジオボタンは今のUIには無いので
+//       それを待つと必ず30秒Timeoutになる。
+//       なので callform は一切触らない。
+//
+async function fillFormAndSubmit(page, { comment, rating }) {
+  //
+  // 1. テキストエリアにクチコミ本文を入れる
+  //    フォーム上には基本的に textarea が1個だけなので、それを取る
+  //
+  const textArea = page.locator('textarea').first();
+  await textArea.waitFor({ state: 'visible', timeout: 10000 });
+  await textArea.scrollIntoViewIfNeeded();
+
+  if (comment) {
+    await textArea.fill(comment);
+  }
+
+  //
+  // 2. ★評価(必須)
+  //    まずは素直に input[name="rating"][value="3"] みたいなラジオがあるか探す
+  //
+  if (rating) {
+    const radioSelector = `input[name="rating"][value="${rating}"]`;
+    const starRadio = page.locator(radioSelector).first();
+
+    if (await starRadio.count()) {
+      await starRadio.check();
+    } else {
+      // もしラジオじゃなくて「input[name=rating] + label」で★をクリックさせる実装なら、
+      // rating番目(1始まり)の★ラベルをクリックする。
+      const starLabels = page.locator("input[name='rating'] + label");
+      const idx = Number(rating) - 1;
+
+      if (Number.isFinite(idx) && idx >= 0 && (await starLabels.count()) > idx) {
+        await starLabels.nth(idx).click();
+      }
+    }
+  }
+
+  //
+  // 3. 「書き込む」ボタンを押す
+  //
+  // パターンA: <button>書き込む</button>
+  let submitBtn = page.getByRole('button', { name: '書き込む' }).first();
+
+  if (await submitBtn.count() === 0) {
+    // パターンB: <input type="submit" value="書き込む">
+    submitBtn = page.locator('input[type="submit"][value="書き込む"]').first();
+  }
+
+  await submitBtn.click();
+
+  //
+  // 4. 投稿後のロード待ち
+  //    （成功するとリロードや完了ページに行くはずなので、一旦DOMが安定するまで待機）
+  //
+  await page.waitForLoadState('domcontentloaded');
+}
+
 // 3. Main automation: take phone/comment/callform/rating, navigate to the phone page, click「クチコミを書く」,
 //    fill the textarea etc., submit, wait for navigation.
 async function postViaPlaywright({ phone, comment, callform, rating }) {
@@ -73,54 +141,8 @@ async function postViaPlaywright({ phone, comment, callform, rating }) {
     // ページ遷移待ち
     await page.waitForLoadState('domcontentloaded');
 
-    // 3) textarea にコメントを入力
-    //    （あなたの実装で使っていたセレクタに合わせてここ調整）
-    const commentBox = await page.locator('textarea[name="comment"]').first();
-    await commentBox.fill(comment);
-
-    // 4) 「電話の目的」のラジオ (callform)
-    //    これは name="callform" 系のラジオがある想定
-    await page
-      .getByRole('radio', { name: callform, exact: false })
-      .check()
-      .catch(async () => {
-        // fallback: 最初のラジオにチェック
-        const anyRadio = page.locator('input[type="radio"][name="callform"]').first();
-        await anyRadio.check();
-      });
-
-    // 5) 星評価 (rating)
-    //    サイト側が "★3" ボタンとか、select[name=rating] とかなら合わせる
-    const ratingSelector = `input[type="radio"][name="rating"][value="${rating}"], select[name="rating"]`;
-    if (await page.locator(ratingSelector).count()) {
-      await page.locator(ratingSelector).first().click();
-    } else {
-      // fallbackなにもしない
-    }
-
-    // 6) 必須の同意チェックボックスなどがあればチェック
-    const agreeBox = page.locator(
-      'input[type="checkbox"][name="agreement"], input[type="checkbox"][id*="agree"]',
-    );
-    if (await agreeBox.count()) {
-      await agreeBox
-        .first()
-        .check({ force: true })
-        .catch(() => {});
-    }
-
-    // 7) 送信ボタンを押す
-    //    form[action*="/post"] submit
-    const form = page.locator('form[action*="/post"]').first();
-    await Promise.all([
-      form
-        .locator(
-          'input[type="submit"],button[type="submit"],input[type="button"][value*="投稿"],button:has-text("投稿")',
-        )
-        .first()
-        .click(),
-      page.waitForNavigation({ waitUntil: 'domcontentloaded' }).catch(() => {}), // 最悪ナビゲーションしなくてもOK
-    ]);
+    // 新実装: callform はもう触らず、上で書き直した関数を呼ぶだけ
+    await fillFormAndSubmit(page, { comment, rating });
 
     // 8) 簡単な成功判定 (エラーメッセージが出てないとか)
     const pageContent = await page.content();
@@ -189,4 +211,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`listening on ${PORT}`);
 });
-

@@ -137,3 +137,11 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# Playwright / Chrome persistent profile (保持しておきたいがGitには載せない)
+chrome-profile/
+telnavi-n8n/chrome-profile/
+telnavi-n8n/chrome-profile/**
+
+# VSCode workspace local stateなども無視したい場合はこんなのも入れてOK:
+telnavi-n8n/chrome-profile/**/*
