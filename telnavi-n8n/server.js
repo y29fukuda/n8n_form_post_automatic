@@ -130,7 +130,11 @@ async function ensureCfOrForm({ page }) {
   return false;
 }
 
-async function gotoPostForm({ page, phone }) {
+async function gotoPostForm(opts = {}) {
+  const { page, phone } = opts;
+  if (!page) throw new Error('page is required');
+  if (!phone) throw new Error('phone is required');
+
   const phoneUrl = `https://www.telnavi.jp/phone/${encodeURIComponent(phone)}`;
   const postUrl = `${phoneUrl}/post`;
 
@@ -172,11 +176,19 @@ async function gotoPostForm({ page, phone }) {
   return { form, postUrl };
 }
 
-async function fillFormAndSubmit({ page, form, comment, callform, rating }) {
+async function fillFormAndSubmit(opts = {}) {
+  const { page, form } = opts;
+  if (!page) throw new Error('page is required');
+  if (!form) throw new Error('form is required');
+
+  const comment = opts.comment ?? '';
+  const callform = opts.callform ?? '';
+  const rating = opts.rating ?? '3';
+
   const textarea = form.locator('textarea').first();
   if (!(await textarea.count())) throw new Error('comment textarea not found');
   await textarea.scrollIntoViewIfNeeded().catch(() => {});
-  await textarea.fill(comment || '', { timeout: 10000 });
+  await textarea.fill(comment, { timeout: 10000 });
 
   if (callform) {
     const callRadio = form.locator(`input[name="callform"][value="${callform}"]`).first();
@@ -214,15 +226,16 @@ async function fillFormAndSubmit({ page, form, comment, callform, rating }) {
 app.post('/post', async (req, res) => {
   console.log('POST /post body =', req.body);
   try {
-    const body = req.body;
-    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    const payload = req.body;
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
       return res.status(400).json({ ok: false, error: 'body must be a JSON object' });
     }
 
-    const { phone, comment, callform, rating } = body;
-    if (!phone) return res.status(400).json({ ok: false, error: 'phone is required' });
+    if (!payload.phone) {
+      return res.status(400).json({ ok: false, error: 'phone is required' });
+    }
 
-    const result = await postViaPlaywright({ phone, comment, callform, rating });
+    const result = await postViaPlaywright(payload);
 
     return res.json({ ok: true, result });
   } catch (err) {
@@ -233,9 +246,13 @@ app.post('/post', async (req, res) => {
   }
 });
 
-async function postViaPlaywright(opts) {
-  const { phone, comment, callform, rating } = opts;
-  const normalizedRating = rating ? String(rating) : '3';
+async function postViaPlaywright(opts = {}) {
+  const phone = opts.phone;
+  if (!phone) throw new Error('phone is required');
+
+  const comment = opts.comment ?? '';
+  const callform = opts.callform ?? '';
+  const rating = opts.rating != null ? String(opts.rating) : '3';
   let context;
   let page;
 
@@ -243,22 +260,17 @@ async function postViaPlaywright(opts) {
     ({ context, page } = await launchPersistentContext());
     await page.bringToFront();
 
-    const { form } = await gotoPostForm({ page, phone });
+    const shared = { page, phone, comment, callform, rating };
+    const { form } = await gotoPostForm(shared);
 
-    await fillFormAndSubmit({
-      page,
-      form,
-      comment,
-      callform,
-      rating: normalizedRating,
-    });
+    await fillFormAndSubmit({ ...shared, form });
 
     const bodyText = await page.evaluate(() => document.body?.innerText || '');
     if (/予期せぬエラー/.test(bodyText)) {
       throw new Error('unexpected error shown by site');
     }
 
-    return { url: page.url(), phone, comment, callform, rating: normalizedRating };
+    return { url: page.url(), phone, comment, callform, rating };
   } finally {
     try {
       await context?.close();
