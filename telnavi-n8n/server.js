@@ -3,6 +3,9 @@ const path = require('path');
 const express = require('express');
 const { chromium } = require('playwright');
 
+const app = express();
+app.use(express.json());
+
 const PROFILE_DIR = path.resolve(__dirname, 'chrome-profile'); // NOTE: DO NOT DELETE PROFILE DIRECTORY ANYMORE
 
 function findChromeExe() {
@@ -23,29 +26,59 @@ function findChromeExe() {
   throw new Error('Chrome executable not found. Please install Chrome.');
 }
 
-async function fillFormAndSubmit(page, { comment, rating }) {
-  const textarea = page.locator('textarea').first();
-  await textarea.waitFor({ state: 'visible', timeout: 15000 });
-  await textarea.scrollIntoViewIfNeeded();
-  if (comment) {
-    await textarea.fill(comment);
+async function fillFormAndSubmit(page, { comment, rating, callFrom, callPurpose }) {
+  const fromValue = callFrom ?? '';
+  const purposeValue = callPurpose ?? '';
+
+  const fromInput = page.locator('#callFrom').first();
+  if (await fromInput.count()) {
+    await fromInput.scrollIntoViewIfNeeded().catch(() => {});
+    await fromInput.fill(fromValue).catch(err => console.warn('callFrom fill warning:', err));
+  } else {
+    console.warn('#callFrom input not found');
   }
 
-  const ratingValue = (rating && String(rating).trim()) || '3';
+  const purposeInput = page.locator('#callPurpose').first();
+  if (await purposeInput.count()) {
+    await purposeInput.scrollIntoViewIfNeeded().catch(() => {});
+    await purposeInput.fill(purposeValue).catch(err => console.warn('callPurpose fill warning:', err));
+  } else {
+    console.warn('#callPurpose input not found');
+  }
+
+  const textarea = page.locator('textarea').first();
+  await textarea.waitFor({ state: 'visible', timeout: 15000 });
+  await textarea.scrollIntoViewIfNeeded().catch(() => {});
+  await textarea.fill(comment ?? '').catch(err => console.warn('comment fill warning:', err));
+
+  const ratingValue = (() => {
+    const trimmed = String(rating ?? '').trim();
+    const parsed = parseInt(trimmed, 10);
+    if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 5) {
+      return String(parsed);
+    }
+    return '3';
+  })();
+
   const labelSelector = `label[for="phone_rating-${ratingValue}"]`;
   const starLabel = page.locator(labelSelector).first();
-
   let ratingSelected = false;
+
   if (await starLabel.count()) {
-    await starLabel.scrollIntoViewIfNeeded();
-    await starLabel.click({ timeout: 5000 });
+    await starLabel.scrollIntoViewIfNeeded().catch(() => {});
+    await starLabel.click({ timeout: 5000 }).catch(() => {});
     ratingSelected = true;
   } else {
-    const radioSelector = `input[name="rating"][value="${ratingValue}"]`;
+    const radioSelector = [
+      `input[type="radio"][name="phone_rating"][value="${ratingValue}"]`,
+      `input[type="radio"][name="rating"][value="${ratingValue}"]`,
+    ].join(',');
     const radio = page.locator(radioSelector).first();
     if (await radio.count()) {
-      await radio.scrollIntoViewIfNeeded();
-      await radio.check({ force: true, timeout: 5000 });
+      await radio.scrollIntoViewIfNeeded().catch(() => {});
+      await radio.check({ force: true, timeout: 5000 }).catch(async () => {
+        await radio.click({ timeout: 5000 }).catch(() => {});
+      });
       ratingSelected = true;
     }
   }
@@ -55,24 +88,23 @@ async function fillFormAndSubmit(page, { comment, rating }) {
   }
 
   let submit = page.getByRole('button', { name: '書き込む' }).first();
-  if (await submit.count() === 0) {
+  if ((await submit.count()) === 0) {
     submit = page.locator('input[type="submit"][value="書き込む"]').first();
   }
 
-  await submit.click({ timeout: 10000 });
+  await submit.click({ timeout: 10000 }).catch(err => {
+    throw new Error(`failed to click submit button: ${err}`);
+  });
   await page.waitForLoadState('domcontentloaded', { timeout: 30000 }).catch(() => {});
 }
 
-async function postViaPlaywright({ phone, comment, callform, rating }) {
-  console.log('== postViaPlaywright START ==');
-  console.log('phone   =', phone);
-  console.log('comment =', comment);
-  console.log('callform=', callform);
-  console.log('rating  =', rating);
-
+async function postViaPlaywright(phone, comment, callFrom, callPurpose, rating) {
   if (!phone) {
     throw new Error('phone is required');
   }
+
+  const resolvedCallFrom = callFrom ?? '';
+  const resolvedCallPurpose = callPurpose ?? '';
 
   const chromePath = findChromeExe();
   const browser = await chromium.launchPersistentContext(PROFILE_DIR, {
@@ -107,44 +139,58 @@ async function postViaPlaywright({ phone, comment, callform, rating }) {
       await page.goto(postUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
     }
 
-    await fillFormAndSubmit(page, { comment, rating });
+    await fillFormAndSubmit(page, {
+      comment,
+      rating,
+      callFrom: resolvedCallFrom,
+      callPurpose: resolvedCallPurpose,
+    });
 
     const bodyHtml = await page.content();
     const success = /ありがとうございました|投稿を受け付けました|反映までお待ちください/.test(bodyHtml);
 
     if (!success) {
-      return {
-        ok: false,
-        stage: 'after_submit',
-        hint: bodyHtml.slice(0, 500),
-      };
+      const snippet = bodyHtml.slice(0, 500);
+      throw new Error(`after_submit: unexpected post-submission content: ${snippet}`);
     }
 
-    return { ok: true };
-  } catch (error) {
-    console.error('Automation error:', error);
-    return { ok: false, stage: 'playwright', error: String(error) };
+    return 'OK after_submit';
   } finally {
-    await browser.close();
+    await browser.close().catch(err => console.warn('Error closing browser:', err));
   }
 }
 
-const app = express();
-app.use(express.json());
-
 app.post('/post', async (req, res) => {
   try {
-    const { phone, comment, callform, rating } = req.body || {};
+    const { phone, comment, callFrom, callPurpose, callform, rating } = req.body || {};
 
     if (!phone) {
-      return res.status(400).json({ ok: false, error: 'phone is required' });
+      res.status(400).type('text/plain').send('phone is required');
+      return;
     }
 
-    const result = await postViaPlaywright({ phone, comment, callform, rating });
-    res.json(result);
-  } catch (err) {
-    console.error('Server /post error:', err);
-    res.status(500).json({ ok: false, serverError: String(err) });
+    const resolvedCallFrom = callFrom ?? callform ?? '';
+    const resolvedCallPurpose = callPurpose ?? callform ?? '';
+
+    console.log('== postViaPlaywright START ==');
+    console.log('phone       =', phone);
+    console.log('comment     =', comment);
+    console.log('callFrom    =', resolvedCallFrom);
+    console.log('callPurpose =', resolvedCallPurpose);
+    console.log('rating      =', rating);
+
+    const resultText = await postViaPlaywright(
+      phone,
+      comment,
+      resolvedCallFrom,
+      resolvedCallPurpose,
+      rating,
+    );
+
+    res.type('text/plain').send(resultText);
+  } catch (error) {
+    console.error('Server /post error:', error);
+    res.status(500).type('text/plain').send(String(error?.message || error));
   }
 });
 
