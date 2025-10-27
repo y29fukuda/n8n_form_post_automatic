@@ -145,3 +145,12 @@ telnavi-n8n/chrome-profile/**
 
 # VSCode workspace local stateなども無視したい場合はこんなのも入れてOK:
 telnavi-n8n/chrome-profile/**/*
+
+# CloudflareトンネルのURLメモ
+# → 毎回変わるし、公開URLなのでコミット禁止
+telnavi-n8n/tunnel-url.txt
+tunnel-url.txt
+*.tunnel-url.txt
+
+# その他このプロジェクト固有の一時ファイル・スクショ
+error-screenshot.png
