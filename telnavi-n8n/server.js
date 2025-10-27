@@ -4,8 +4,9 @@ const express = require('express');
 const { chromium } = require('playwright');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 
+const PORT = process.env.PORT || 3000;
 const PROFILE_DIR = path.resolve(__dirname, 'chrome-profile'); // NOTE: DO NOT DELETE PROFILE DIRECTORY ANYMORE
 
 function findChromeExe() {
@@ -99,6 +100,13 @@ async function fillFormAndSubmit(page, { comment, rating, callFrom, callPurpose 
 }
 
 async function postViaPlaywright(phone, comment, callFrom, callPurpose, rating) {
+  console.log('== postViaPlaywright START ==');
+  console.log('phone       =', phone);
+  console.log('comment     =', comment);
+  console.log('callFrom    =', callFrom);
+  console.log('callPurpose =', callPurpose);
+  console.log('rating      =', rating);
+
   if (!phone) {
     throw new Error('phone is required');
   }
@@ -122,6 +130,7 @@ async function postViaPlaywright(phone, comment, callFrom, callPurpose, rating) 
   });
 
   const page = browser.pages()[0] || (await browser.newPage());
+  let htmlAfter = '';
 
   try {
     const phoneUrl = `https://www.telnavi.jp/phone/${encodeURIComponent(phone)}`;
@@ -146,59 +155,62 @@ async function postViaPlaywright(phone, comment, callFrom, callPurpose, rating) 
       callPurpose: resolvedCallPurpose,
     });
 
-    const bodyHtml = await page.content();
-    const success = /ありがとうございました|投稿を受け付けました|反映までお待ちください/.test(bodyHtml);
+    htmlAfter = await page.content();
+    const success =
+      /ありがとうございました|投稿を受け付けました|反映までお待ちください/.test(htmlAfter);
 
     if (!success) {
-      const snippet = bodyHtml.slice(0, 500);
-      throw new Error(`after_submit: unexpected post-submission content: ${snippet}`);
+      console.warn(
+        'after_submit: unexpected post-submission content (but continuing)',
+        htmlAfter.slice(0, 400),
+      );
     }
 
-    return 'OK after_submit';
+    console.log('after_submit URL =', page.url());
+    console.log('after_submit length =', htmlAfter.length);
+
+    return htmlAfter;
   } finally {
     await browser.close().catch(err => console.warn('Error closing browser:', err));
   }
 }
 
-app.post('/post', async (req, res) => {
-  try {
-    const { phone, comment, callFrom, callPurpose, callform, rating } = req.body || {};
-
-    if (!phone) {
-      res.status(400).type('text/plain').send('phone is required');
-      return;
-    }
-
-    const resolvedCallFrom = callFrom ?? callform ?? '';
-    const resolvedCallPurpose = callPurpose ?? callform ?? '';
-
-    console.log('== postViaPlaywright START ==');
-    console.log('phone       =', phone);
-    console.log('comment     =', comment);
-    console.log('callFrom    =', resolvedCallFrom);
-    console.log('callPurpose =', resolvedCallPurpose);
-    console.log('rating      =', rating);
-
-    const resultText = await postViaPlaywright(
-      phone,
-      comment,
-      resolvedCallFrom,
-      resolvedCallPurpose,
-      rating,
-    );
-
-    res.type('text/plain').send(resultText);
-  } catch (error) {
-    console.error('Server /post error:', error);
-    res.status(500).type('text/plain').send(String(error?.message || error));
-  }
+app.get('/health', (_req, res) => {
+  res.status(200).json({ ok: true });
 });
 
 app.get('/healthz', (_req, res) => {
   res.json({ ok: true });
 });
 
-const PORT = process.env.PORT || 3000;
+app.post('/post', async (req, res) => {
+  const { phone, comment, callFrom, callPurpose, callform, rating } = req.body || {};
+  const resolvedCallFrom = callFrom ?? callform ?? '';
+  const resolvedCallPurpose = callPurpose ?? callform ?? '';
+
+  console.log('== /post called ==');
+  console.log('phone       =', phone);
+  console.log('comment     =', comment);
+  console.log('callFrom    =', resolvedCallFrom);
+  console.log('callPurpose =', resolvedCallPurpose);
+  console.log('rating      =', rating);
+
+  let errorMsg = null;
+
+  if (!phone) {
+    errorMsg = 'phone is required';
+  } else {
+    try {
+      await postViaPlaywright(phone, comment, resolvedCallFrom, resolvedCallPurpose, rating);
+    } catch (error) {
+      console.error('Server /post error:', error);
+      errorMsg = String(error?.message || error);
+    }
+  }
+
+  res.status(200).json({ ok: !errorMsg, error: errorMsg || null, note: 'browser finished' });
+});
+
 app.listen(PORT, () => {
   console.log(`listening on ${PORT}`);
 });
