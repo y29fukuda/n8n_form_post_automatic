@@ -1,197 +1,192 @@
-// n8n投稿サーバ 最終版（シンプル版）
-// 役割:
-//   - /healthz   : 疎通チェック用
-//   - /post      : n8nやPowerShellからJSONを受け取り、Playwrightで
-//                  telnaviにクチコミを投稿する
-//
-// ポイント:
-//   - なるべく一直線のフローにして、複雑なヘルパーを全部外している
-//   - Cloudflare突破や広告を閉じたChromeプロファイルは
-//     telnavi-n8n/chrome-profile をそのまま使い回す
-
+const fs = require('fs');
 const path = require('path');
 const express = require('express');
-const { chromium } = require('playwright'); // Playwrightはもう入っている想定
+const { chromium } = require('playwright'); // keep this import
 
-const app = express();
-app.use(express.json()); // JSON本文をちゃんと受け取る
+// 1. Helper: locate Chrome.exe on Windows
+function findChromeExe() {
+  const candidates = [
+    process.env['PROGRAMFILES'] + '\\Google\\Chrome\\Application\\chrome.exe',
+    process.env['PROGRAMFILES(X86)'] + '\\Google\\Chrome\\Application\\chrome.exe',
+    process.env['LOCALAPPDATA'] + '\\Google\\Chrome\\Application\\chrome.exe',
+  ].filter(Boolean);
 
-// ブラウザを開いて実際に投稿するメイン処理
-// options: { phone, comment, callform, rating }
-async function postViaPlaywright(options) {
-  const { phone, comment, callform, rating } = options;
+  for (const p of candidates) {
+    try {
+      if (p && fs.existsSync(p)) return p;
+    } catch (_) {}
+  }
 
-  console.log('=== postViaPlaywright START ===');
-  console.log('phone   =', phone);
-  console.log('comment =', comment);
-  console.log('callform=', callform);
-  console.log('rating  =', rating);
+  throw new Error('Chrome executable not found. Please install Chrome.');
+}
 
-  // このフォルダを既存の "cf_clearance 済み" Chromeプロファイルとして使う。
-  // ここでは telnavi-n8n/chrome-profile を使う。
-  const userDataDir = path.resolve(__dirname, './chrome-profile');
+// 2. Helper: launch or attach to persistent Chrome context using our saved profile
+async function openPersistentContext() {
+  const userDataDir = path.resolve(__dirname, 'chrome-profile'); // same folder we used in manual step B
+  const chromePath = findChromeExe();
 
-  // ユーザープロファイルを再利用するPersistentContextで起動:
-  //   - headless:false にして目視できるようにする
-  //   - 変な初回ダイアログ/広告ブロックの影響を減らす軽いフラグだけ追加
   const context = await chromium.launchPersistentContext(userDataDir, {
-    headless: false,
+    executablePath: chromePath,
+    headless: false, // we want visible for now / Cloudflare friendly
     viewport: { width: 1280, height: 800 },
     args: [
       '--disable-blink-features=AutomationControlled',
+      '--no-first-run',
       '--no-default-browser-check',
       '--disable-popup-blocking',
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
     ],
   });
 
-  const page = await context.newPage();
+  // Grab an existing page (Chrome usually opens 1 tab automatically)
+  let page = context.pages()[0];
+  if (!page) {
+    page = await context.newPage();
+  }
+
+  return { context, page };
+}
+
+// 3. Main automation: take phone/comment/callform/rating, navigate to the phone page, click「クチコミを書く」,
+//    fill the textarea etc., submit, wait for navigation.
+async function postViaPlaywright({ phone, comment, callform, rating }) {
+  console.log('== postViaPlaywright START ==');
+  console.log('phone    =', phone);
+  console.log('comment  =', comment);
+  console.log('callform =', callform);
+  console.log('rating   =', rating);
+
+  // launch persistent Chrome with the shared profile
+  const { context, page } = await openPersistentContext();
 
   try {
-    // 1. 対象の電話番号ページを開く
-    console.log('[1] goto phone page');
-    await page.goto(`https://www.telnavi.jp/phone/${phone}`, {
-      waitUntil: 'domcontentloaded',
-      timeout: 30000,
-    });
+    // 1) 対象の電話番号ページへ遷移
+    const targetUrl = `https://www.telnavi.jp/phone/${phone}`;
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded' });
 
-    // 念のためページトップにスクロールしておく
-    await page.evaluate(() => {
-      window.scrollTo(0, 0);
-    });
+    // 2) 「クチコミを書く」リンクを探してクリック
+    //    (サイトUIによっては "クチコミを書く" ボタンやアンカーリンク)
+    const linkLocator = page.getByRole('link', { name: /クチコミを書く/ });
+    await linkLocator.click();
 
-    // 2. 「クチコミを書く」フォーム(/post)に進む
-    //    → a[href$="/post"] を探してクリック
-    console.log('[2] open /post form');
-    const postLink = page.locator('a[href$="/post"]');
-    await postLink.first().click({ force: true });
+    // ページ遷移待ち
+    await page.waitForLoadState('domcontentloaded');
 
-    // フォームページのDOMロード待ち
-    await page.waitForLoadState('domcontentloaded', { timeout: 30000 });
-    await page.waitForTimeout(500); // 小さい待ちで安定させる
+    // 3) textarea にコメントを入力
+    //    （あなたの実装で使っていたセレクタに合わせてここ調整）
+    const commentBox = await page.locator('textarea[name="comment"]').first();
+    await commentBox.fill(comment);
 
-    // 3. テキストエリア（コメント）入力
-    console.log('[3] fill comment textarea');
-    // name="comment" があればそこに入れる。なければ最初のtextareaに入れる
-    let commentBox = page.locator('textarea[name="comment"]');
-    if ((await commentBox.count()) === 0) {
-      commentBox = page.locator('textarea');
+    // 4) 「電話の目的」のラジオ (callform)
+    //    これは name="callform" 系のラジオがある想定
+    await page
+      .getByRole('radio', { name: callform, exact: false })
+      .check()
+      .catch(async () => {
+        // fallback: 最初のラジオにチェック
+        const anyRadio = page.locator('input[type="radio"][name="callform"]').first();
+        await anyRadio.check();
+      });
+
+    // 5) 星評価 (rating)
+    //    サイト側が "★3" ボタンとか、select[name=rating] とかなら合わせる
+    const ratingSelector = `input[type="radio"][name="rating"][value="${rating}"], select[name="rating"]`;
+    if (await page.locator(ratingSelector).count()) {
+      await page.locator(ratingSelector).first().click();
+    } else {
+      // fallbackなにもしない
     }
-    await commentBox.first().fill(comment);
 
-    // 4. 「電話の目的」/用途ラジオ (営業電話など)
-    //    まずはラベル名一致でとれるradioを試す
-    console.log('[4] select callform radio');
-    const callformRadioByLabel = page.getByRole('radio', { name: callform });
-    if ((await callformRadioByLabel.count()) > 0) {
-      // check() が使えない場合は click() fallback
-      await callformRadioByLabel
+    // 6) 必須の同意チェックボックスなどがあればチェック
+    const agreeBox = page.locator(
+      'input[type="checkbox"][name="agreement"], input[type="checkbox"][id*="agree"]',
+    );
+    if (await agreeBox.count()) {
+      await agreeBox
         .first()
         .check({ force: true })
-        .catch(async () => {
-          await callformRadioByLabel.first().click({ force: true });
-        });
-    } else {
-      // fallback: <input type="radio" name="callform" value="営業電話"> のような形を直接探す
-      const callformRadioByValue = page.locator(
-        `input[type="radio"][name="callform"][value="${callform}"]`,
-      );
-      if ((await callformRadioByValue.count()) > 0) {
-        await callformRadioByValue
-          .first()
-          .check({ force: true })
-          .catch(async () => {
-            await callformRadioByValue.first().click({ force: true });
-          });
-      } else {
-        console.warn('[warn] callform radio not found');
-      }
+        .catch(() => {});
     }
 
-    // 5. 星評価 (rating)
-    //    期待形: <input type="radio" name="rating" value="3"> など
-    console.log('[5] select rating radio');
-    const ratingRadioByValue = page.locator(
-      `input[type="radio"][name="rating"][value="${rating}"]`,
-    );
-    if ((await ratingRadioByValue.count()) > 0) {
-      await ratingRadioByValue
+    // 7) 送信ボタンを押す
+    //    form[action*="/post"] submit
+    const form = page.locator('form[action*="/post"]').first();
+    await Promise.all([
+      form
+        .locator(
+          'input[type="submit"],button[type="submit"],input[type="button"][value*="投稿"],button:has-text("投稿")',
+        )
         .first()
-        .check({ force: true })
-        .catch(async () => {
-          await ratingRadioByValue.first().click({ force: true });
-        });
-    } else {
-      // fallback: label[for*="3"] とか star系のlabelをクリック
-      const ratingLabel = page.locator(`label[for*="${rating}"]`);
-      if ((await ratingLabel.count()) > 0) {
-        await ratingLabel.first().click({ force: true });
-      } else {
-        console.warn('[warn] rating radio not found');
-      }
+        .click(),
+      page.waitForNavigation({ waitUntil: 'domcontentloaded' }).catch(() => {}), // 最悪ナビゲーションしなくてもOK
+    ]);
+
+    // 8) 簡単な成功判定 (エラーメッセージが出てないとか)
+    const pageContent = await page.content();
+    if (/ありがとうございました|投稿を受け付けました|反映までお待ちください/.test(pageContent)) {
+      console.log('投稿成功っぽい');
+      return { ok: true };
     }
 
-    // 6. 送信ボタン押下
-    console.log('[6] submit form');
-    // 基本的に form[action^="/post"] 内の submitボタン(input[type=submit] or button[type=submit])
-    const submitBtn = page.locator(
-      'form[action^="/post"] input[type="submit"], form[action^="/post"] button[type="submit"]',
-    );
-    await submitBtn.first().click({ force: true });
-
-    // 送信後の画面ロード待ち（=投稿完了ページ/エラー表示ページ）
-    await page.waitForLoadState('domcontentloaded', { timeout: 30000 });
-    await page.waitForTimeout(800); // ほんの少し待つ
-
-    console.log('[7] submission finished (no crash)');
-
-    // 表示されているURLやタイトルをログに出しておくとデバッグしやすい
-    console.log('after submit URL =', page.url());
-    console.log('after submit TITLE =', await page.title());
-
-    // 終了
-    await context.close();
-
-    console.log('=== postViaPlaywright OK ===');
-    return { ok: true };
+    console.log('投稿後の画面にエラーっぽい表示があります。');
+    return { ok: false, stage: 'after_submit', hint: pageContent.slice(0, 400) };
   } catch (err) {
-    console.error('postViaPlaywright ERROR:', err);
-    await context.close();
-    return { ok: false, error: String(err) };
+    console.error('Automation error:', err);
+    return { ok: false, stage: 'playwright', error: String(err) };
+  } finally {
+    // contextは閉じないで保持したい場合はここをコメントアウト
+    // 今回は一旦閉じずに cookie 等を生かしたいなら close() しないのが大事
+    // await context.close();
   }
 }
 
-// /healthz は疎通確認用（n8nの事前チェックやPowerShellの簡易チェックで使える）
+// 4. Expressサーバー側 /post ハンドラ:
+//    - JSON受け取り
+//    - postViaPlaywright呼んで結果返す
+const app = express();
+app.use(express.json());
+
+app.post('/post', async (req, res) => {
+  try {
+    const { phone, comment, callform, rating } = req.body;
+
+    console.log('POST /post body = {');
+    console.log('  callform:', JSON.stringify(callform), ',');
+    console.log('  rating: ', JSON.stringify(rating), ',');
+    console.log('  comment:', JSON.stringify(comment), ',');
+    console.log('  phone:  ', JSON.stringify(phone));
+    console.log('}');
+
+    const result = await postViaPlaywright({
+      phone,
+      comment,
+      callform,
+      rating,
+    });
+
+    if (result.ok) {
+      res.json({ ok: true });
+    } else {
+      res.json({
+        ok: false,
+        error: result.error || null,
+        stage: result.stage,
+        hint: result.hint || null,
+      });
+    }
+  } catch (err) {
+    console.error('Server /post error:', err);
+    res.status(500).json({ ok: false, serverError: String(err) });
+  }
+});
+
 app.get('/healthz', (_req, res) => {
   res.json({ ok: true });
 });
 
-// /post は n8n / PowerShell から叩く本番API
-// 期待するリクエストBody(JSON):
-//   {
-//     "phone": "0677122972",
-//     "comment": "とにかくしつこい営業電話でした",
-//     "callform": "営業電話",
-//     "rating": "3"
-//   }
-app.post('/post', async (req, res) => {
-  const payload = req.body || {};
-  console.log('POST /post body =', payload);
-
-  // Playwrightで投稿実行
-  const result = await postViaPlaywright({
-    phone: payload.phone,
-    comment: payload.comment,
-    callform: payload.callform,
-    rating: payload.rating,
-  });
-
-  console.log('RESULT =>', result);
-  res.json(result);
-});
-
-// サーバ起動
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log('listening on', PORT);
+  console.log(`listening on ${PORT}`);
 });
 
