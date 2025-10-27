@@ -1,0 +1,19 @@
+# /etc/systemd/system/cloudflared.service
+# Replace TUNNEL_NAME with the name you used when creating the tunnel.
+[Unit]
+Description=Cloudflared Tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/cloudflared tunnel run TUNNEL_NAME
+Restart=always
+RestartSec=5
+Environment=HOME=/root
+WorkingDirectory=/root
+User=root
+
+[Install]
+WantedBy=multi-user.target
+

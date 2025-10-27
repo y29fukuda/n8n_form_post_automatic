@@ -1,0 +1,19 @@
+# /etc/systemd/system/telnavi-server.service
+# Replace USER_NAME with the non-root user account that should run the service.
+# Update WorkingDirectory if you deploy to a different path.
+[Unit]
+Description=TelNavi Playwright Server
+After=network.target
+
+[Service]
+Type=simple
+User=USER_NAME
+WorkingDirectory=/opt/telnavi-n8n
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=5
+EnvironmentFile=-/etc/default/telnavi-server
+
+[Install]
+WantedBy=multi-user.target
+

@@ -1,0 +1,7 @@
+# /etc/default/telnavi-server
+# Add any additional environment variables here if server.js reads them.
+NODE_ENV=production
+PORT=3000
+TARGET_FORM_URL=""
+PLAYWRIGHT_TIMEOUT_MS=60000
+
