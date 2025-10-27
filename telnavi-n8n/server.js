@@ -115,14 +115,13 @@ async function ensureCfOrForm({ page }) {
 
   while (Date.now() < deadline) {
     const ok = await page.evaluate(
-      (challenge, form) => {
+      ({ challenge, form }) => {
         const isVisible = el => el && el.offsetParent !== null;
         const c = document.querySelector(challenge);
         const f = document.querySelector(form);
         return (c && isVisible(c)) || (f && isVisible(f));
       },
-      challengeSel,
-      formSel,
+      { challenge: challengeSel, form: formSel },
     );
     if (ok) return true;
     await page.waitForTimeout(800);
