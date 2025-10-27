@@ -1,280 +1,197 @@
-const express = require('express');
+// n8n投稿サーバ 最終版（シンプル版）
+// 役割:
+//   - /healthz   : 疎通チェック用
+//   - /post      : n8nやPowerShellからJSONを受け取り、Playwrightで
+//                  telnaviにクチコミを投稿する
+//
+// ポイント:
+//   - なるべく一直線のフローにして、複雑なヘルパーを全部外している
+//   - Cloudflare突破や広告を閉じたChromeプロファイルは
+//     telnavi-n8n/chrome-profile をそのまま使い回す
+
 const path = require('path');
-const fs = require('fs');
-const { chromium } = require('playwright');
+const express = require('express');
+const { chromium } = require('playwright'); // Playwrightはもう入っている想定
 
 const app = express();
-app.use(express.json());
+app.use(express.json()); // JSON本文をちゃんと受け取る
 
-const PORT = process.env.PORT || 3000;
-const UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-const PROFILE_DIR = path.join(process.cwd(), 'chrome-profile');
+// ブラウザを開いて実際に投稿するメイン処理
+// options: { phone, comment, callform, rating }
+async function postViaPlaywright(options) {
+  const { phone, comment, callform, rating } = options;
 
-/**
- * Launch (or reuse) a Chrome persistent context pointing at chrome-profile.
- * Returns { context, page } where page is the visible tab.
- */
-async function launchPersistentContext() {
-  const candidates = [
-    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-  ];
+  console.log('=== postViaPlaywright START ===');
+  console.log('phone   =', phone);
+  console.log('comment =', comment);
+  console.log('callform=', callform);
+  console.log('rating  =', rating);
 
-  let executablePath;
-  for (const candidate of candidates) {
-    try {
-      fs.accessSync(candidate);
-      executablePath = candidate;
-      break;
-    } catch {}
-  }
+  // このフォルダを既存の "cf_clearance 済み" Chromeプロファイルとして使う。
+  // ここでは telnavi-n8n/chrome-profile を使う。
+  const userDataDir = path.resolve(__dirname, './chrome-profile');
 
-  const context = await chromium.launchPersistentContext(PROFILE_DIR, {
-    executablePath,
+  // ユーザープロファイルを再利用するPersistentContextで起動:
+  //   - headless:false にして目視できるようにする
+  //   - 変な初回ダイアログ/広告ブロックの影響を減らす軽いフラグだけ追加
+  const context = await chromium.launchPersistentContext(userDataDir, {
     headless: false,
-    viewport: null,
-    userAgent: UA,
-    locale: 'ja-JP',
+    viewport: { width: 1280, height: 800 },
     args: [
       '--disable-blink-features=AutomationControlled',
       '--no-default-browser-check',
-      '--disable-infobars',
-      '--start-maximized',
+      '--disable-popup-blocking',
     ],
   });
 
-  await context.addInitScript(() => {
-    try {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    } catch {}
-  });
+  const page = await context.newPage();
 
-  const pages = context.pages();
-  const page = pages[0] || (await context.newPage());
-  await page.bringToFront();
-
-  return { context, page };
-}
-
-async function squashInterstitials({ page }) {
   try {
-    if (page.url().includes('#google_vignette')) {
-      const closeBtn = page.getByRole('button', { name: /(\u9589|close)/i }).first();
-      if (await closeBtn.isVisible().catch(() => false)) {
-        await closeBtn.click({ timeout: 2000 }).catch(() => {});
+    // 1. 対象の電話番号ページを開く
+    console.log('[1] goto phone page');
+    await page.goto(`https://www.telnavi.jp/phone/${phone}`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 30000,
+    });
+
+    // 念のためページトップにスクロールしておく
+    await page.evaluate(() => {
+      window.scrollTo(0, 0);
+    });
+
+    // 2. 「クチコミを書く」フォーム(/post)に進む
+    //    → a[href$="/post"] を探してクリック
+    console.log('[2] open /post form');
+    const postLink = page.locator('a[href$="/post"]');
+    await postLink.first().click({ force: true });
+
+    // フォームページのDOMロード待ち
+    await page.waitForLoadState('domcontentloaded', { timeout: 30000 });
+    await page.waitForTimeout(500); // 小さい待ちで安定させる
+
+    // 3. テキストエリア（コメント）入力
+    console.log('[3] fill comment textarea');
+    // name="comment" があればそこに入れる。なければ最初のtextareaに入れる
+    let commentBox = page.locator('textarea[name="comment"]');
+    if ((await commentBox.count()) === 0) {
+      commentBox = page.locator('textarea');
+    }
+    await commentBox.first().fill(comment);
+
+    // 4. 「電話の目的」/用途ラジオ (営業電話など)
+    //    まずはラベル名一致でとれるradioを試す
+    console.log('[4] select callform radio');
+    const callformRadioByLabel = page.getByRole('radio', { name: callform });
+    if ((await callformRadioByLabel.count()) > 0) {
+      // check() が使えない場合は click() fallback
+      await callformRadioByLabel
+        .first()
+        .check({ force: true })
+        .catch(async () => {
+          await callformRadioByLabel.first().click({ force: true });
+        });
+    } else {
+      // fallback: <input type="radio" name="callform" value="営業電話"> のような形を直接探す
+      const callformRadioByValue = page.locator(
+        `input[type="radio"][name="callform"][value="${callform}"]`,
+      );
+      if ((await callformRadioByValue.count()) > 0) {
+        await callformRadioByValue
+          .first()
+          .check({ force: true })
+          .catch(async () => {
+            await callformRadioByValue.first().click({ force: true });
+          });
       } else {
-        await page.keyboard.press('Escape').catch(() => {});
+        console.warn('[warn] callform radio not found');
       }
-      await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
     }
 
-    const vignetteFrame = page.frameLocator('iframe[name="google_vignette"]').first();
-    if (await vignetteFrame.locator('body').isVisible({ timeout: 1000 }).catch(() => false)) {
-      const btn = vignetteFrame.getByRole('button', { name: /(\u9589|close)/i }).first();
-      await btn.click({ timeout: 2000 }).catch(() => page.keyboard.press('Escape').catch(() => {}));
-      await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
-    }
-
-    await page
-      .locator(
-        [
-          '#cf-please-wait',
-          '.challenge-form',
-          '.challenge-running',
-          '[data-cf]',
-          '#turnstile-wrapper',
-          '#cf-browser-verification',
-        ].join(','),
-      )
-      .waitFor({ state: 'detached', timeout: 30000 })
-      .catch(() => {});
-  } catch {}
-}
-
-async function safeGoto({ page, url }) {
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await squashInterstitials({ page });
-}
-
-async function ensureCfOrForm({ page }) {
-  const challengeSel = [
-    '#challenge-form',
-    '.challenge-form',
-    '#cf-browser-verification',
-    '.cf-challenge',
-    '.cf-please-wait',
-    '[data-cf*="hcaptcha-box"]',
-    '#turnstile-wrapper',
-    '.cf-chl-widget',
-  ].join(',');
-  const formSel = 'form[action^="/post"]';
-  const deadline = Date.now() + 60_000;
-
-  while (Date.now() < deadline) {
-    const ok = await page.evaluate(
-      ({ challenge, form }) => {
-        const isVisible = el => el && el.offsetParent !== null;
-        const c = document.querySelector(challenge);
-        const f = document.querySelector(form);
-        return (c && isVisible(c)) || (f && isVisible(f));
-      },
-      { challenge: challengeSel, form: formSel },
+    // 5. 星評価 (rating)
+    //    期待形: <input type="radio" name="rating" value="3"> など
+    console.log('[5] select rating radio');
+    const ratingRadioByValue = page.locator(
+      `input[type="radio"][name="rating"][value="${rating}"]`,
     );
-    if (ok) return true;
-    await page.waitForTimeout(800);
-  }
-  return false;
-}
-
-async function gotoPostForm(opts = {}) {
-  const { page, phone } = opts;
-  if (!page) throw new Error('page is required');
-  if (!phone) throw new Error('phone is required');
-
-  const phoneUrl = `https://www.telnavi.jp/phone/${encodeURIComponent(phone)}`;
-  const postUrl = `${phoneUrl}/post`;
-
-  await safeGoto({ page, url: phoneUrl });
-  await ensureCfOrForm({ page });
-
-  const postLink = page
-    .locator('a[href$="/post"]')
-    .filter({ hasText: /\u30af\u30c1\u30b3\u30df/ })
-    .first();
-
-  if (await postLink.isVisible().catch(() => false)) {
-    await Promise.all([
-      page.waitForURL(/\/post(\?|$)/, { timeout: 15000 }).catch(() => {}),
-      postLink.click({ trial: false }),
-    ]);
-  } else {
-    await safeGoto({ page, url: postUrl });
-  }
-
-  await squashInterstitials({ page });
-
-  await Promise.race([
-    page.waitForSelector('form[action$="/post"]', { timeout: 15000 }),
-    page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {}),
-  ]).catch(() => {});
-
-  let form = page.locator('form[action$="/post"]').first();
-  let visible = await form.isVisible().catch(() => false);
-
-  if (!visible) {
-    await safeGoto({ page, url: postUrl });
-    await page.waitForSelector('form[action$="/post"]', { timeout: 15000 }).catch(() => {});
-    form = page.locator('form[action$="/post"]').first();
-    visible = await form.isVisible().catch(() => false);
-    if (!visible) throw new Error('post form not available');
-  }
-
-  return { form, postUrl };
-}
-
-async function fillFormAndSubmit(opts = {}) {
-  const { page, form } = opts;
-  if (!page) throw new Error('page is required');
-  if (!form) throw new Error('form is required');
-
-  const comment = opts.comment ?? '';
-  const callform = opts.callform ?? '';
-  const rating = opts.rating ?? '3';
-
-  const textarea = form.locator('textarea').first();
-  if (!(await textarea.count())) throw new Error('comment textarea not found');
-  await textarea.scrollIntoViewIfNeeded().catch(() => {});
-  await textarea.fill(comment, { timeout: 10000 });
-
-  if (callform) {
-    const callRadio = form.locator(`input[name="callform"][value="${callform}"]`).first();
-    if (await callRadio.count()) {
-      await callRadio.check({ timeout: 5000 }).catch(() => {});
-    }
-  }
-
-  if (rating) {
-    const ratingRadio = form.locator(`input[name$="rating"][value="${rating}"]`).first();
-    if (await ratingRadio.count()) {
-      await ratingRadio.check({ timeout: 5000 }).catch(() => {});
-    }
-  }
-
-  const agreement = form.locator('input[name="agreement"]').first();
-  if (await agreement.count()) {
-    try {
-      await agreement.fill('1');
-    } catch {
-      await page.evaluate(() => {
-        const agree = document.querySelector('input[name="agreement"]');
-        if (agree) agree.value = '1';
-      });
-    }
-  }
-
-  await Promise.all([
-    page.waitForURL(/\/phone\/\d+($|\/)/, { timeout: 15000 }).catch(() => {}),
-    form.locator('input[type="submit"], button[type="submit"]').first().click(),
-  ]);
-  await squashInterstitials({ page });
-}
-
-app.post('/post', async (req, res) => {
-  console.log('POST /post body =', req.body);
-  try {
-    const payload = req.body;
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-      return res.status(400).json({ ok: false, error: 'body must be a JSON object' });
+    if ((await ratingRadioByValue.count()) > 0) {
+      await ratingRadioByValue
+        .first()
+        .check({ force: true })
+        .catch(async () => {
+          await ratingRadioByValue.first().click({ force: true });
+        });
+    } else {
+      // fallback: label[for*="3"] とか star系のlabelをクリック
+      const ratingLabel = page.locator(`label[for*="${rating}"]`);
+      if ((await ratingLabel.count()) > 0) {
+        await ratingLabel.first().click({ force: true });
+      } else {
+        console.warn('[warn] rating radio not found');
+      }
     }
 
-    if (!payload.phone) {
-      return res.status(400).json({ ok: false, error: 'phone is required' });
-    }
+    // 6. 送信ボタン押下
+    console.log('[6] submit form');
+    // 基本的に form[action^="/post"] 内の submitボタン(input[type=submit] or button[type=submit])
+    const submitBtn = page.locator(
+      'form[action^="/post"] input[type="submit"], form[action^="/post"] button[type="submit"]',
+    );
+    await submitBtn.first().click({ force: true });
 
-    const result = await postViaPlaywright(payload);
+    // 送信後の画面ロード待ち（=投稿完了ページ/エラー表示ページ）
+    await page.waitForLoadState('domcontentloaded', { timeout: 30000 });
+    await page.waitForTimeout(800); // ほんの少し待つ
 
-    return res.json({ ok: true, result });
+    console.log('[7] submission finished (no crash)');
+
+    // 表示されているURLやタイトルをログに出しておくとデバッグしやすい
+    console.log('after submit URL =', page.url());
+    console.log('after submit TITLE =', await page.title());
+
+    // 終了
+    await context.close();
+
+    console.log('=== postViaPlaywright OK ===');
+    return { ok: true };
   } catch (err) {
-    console.error(err);
-    return res
-      .status(500)
-      .json({ ok: false, stage: 'route', error: String((err && err.message) || err) });
+    console.error('postViaPlaywright ERROR:', err);
+    await context.close();
+    return { ok: false, error: String(err) };
   }
+}
+
+// /healthz は疎通確認用（n8nの事前チェックやPowerShellの簡易チェックで使える）
+app.get('/healthz', (_req, res) => {
+  res.json({ ok: true });
 });
 
-async function postViaPlaywright(opts = {}) {
-  const phone = opts.phone;
-  if (!phone) throw new Error('phone is required');
+// /post は n8n / PowerShell から叩く本番API
+// 期待するリクエストBody(JSON):
+//   {
+//     "phone": "0677122972",
+//     "comment": "とにかくしつこい営業電話でした",
+//     "callform": "営業電話",
+//     "rating": "3"
+//   }
+app.post('/post', async (req, res) => {
+  const payload = req.body || {};
+  console.log('POST /post body =', payload);
 
-  const comment = opts.comment ?? '';
-  const callform = opts.callform ?? '';
-  const rating = opts.rating != null ? String(opts.rating) : '3';
-  let context;
-  let page;
+  // Playwrightで投稿実行
+  const result = await postViaPlaywright({
+    phone: payload.phone,
+    comment: payload.comment,
+    callform: payload.callform,
+    rating: payload.rating,
+  });
 
-  try {
-    ({ context, page } = await launchPersistentContext());
-    await page.bringToFront();
+  console.log('RESULT =>', result);
+  res.json(result);
+});
 
-    const shared = { page, phone, comment, callform, rating };
-    const { form } = await gotoPostForm(shared);
+// サーバ起動
+const PORT = 3000;
+app.listen(PORT, () => {
+  console.log('listening on', PORT);
+});
 
-    await fillFormAndSubmit({ ...shared, form });
-
-    const bodyText = await page.evaluate(() => document.body?.innerText || '');
-    if (/予期せぬエラー/.test(bodyText)) {
-      throw new Error('unexpected error shown by site');
-    }
-
-    return { url: page.url(), phone, comment, callform, rating };
-  } finally {
-    try {
-      await context?.close();
-    } catch {}
-  }
-}
-
-app.listen(PORT, () => console.log('listening on', PORT));
