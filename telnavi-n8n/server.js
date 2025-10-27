@@ -75,26 +75,24 @@ async function fillFormAndSubmit(page, { comment, rating }) {
   }
 
   //
-  // 2. ★評価(必須)
-  //    まずは素直に input[name="rating"][value="3"] みたいなラジオがあるか探す
+  // 2. ★ 評価をセットする（新ロジック）
+  //    画面上の星は <label for="phone_rating-3"> のような label 要素が実体なので、
+  //    対応するラベルをクリックして選択する。
   //
-  if (rating) {
-    const radioSelector = `input[name="rating"][value="${rating}"]`;
-    const starRadio = page.locator(radioSelector).first();
+  async function selectRating(page, value) {
+    const labelSelector = `label[for="phone_rating-${value}"]`;
+    const starLabel = page.locator(labelSelector).first();
 
-    if (await starRadio.count()) {
-      await starRadio.check();
-    } else {
-      // もしラジオじゃなくて「input[name=rating] + label」で★をクリックさせる実装なら、
-      // rating番目(1始まり)の★ラベルをクリックする。
-      const starLabels = page.locator("input[name='rating'] + label");
-      const idx = Number(rating) - 1;
-
-      if (Number.isFinite(idx) && idx >= 0 && (await starLabels.count()) > idx) {
-        await starLabels.nth(idx).click();
-      }
+    if (!(await starLabel.count())) {
+      throw new Error(`rating label not found for value ${value}`);
     }
+
+    await starLabel.scrollIntoViewIfNeeded();
+    await starLabel.click({ timeout: 5000 });
   }
+
+  const ratingToUse = (rating && String(rating).trim()) || '3';
+  await selectRating(page, ratingToUse);
 
   //
   // 3. 「書き込む」ボタンを押す
